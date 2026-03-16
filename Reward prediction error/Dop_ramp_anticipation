@@ -1,0 +1,459 @@
+import numpy as np
+import matplotlib.pyplot as plt
+import matplotlib.gridspec as gridspec
+import matplotlib.patches as mpatches
+import matplotlib.patheffects as pe
+from matplotlib.widgets import Button, Slider
+ 
+np.random.seed(42)
+ 
+# -------------------------------------------------------------------
+# color scheme — keeping it consistent with the rest of the project
+# -------------------------------------------------------------------
+BG     = '#04080f'
+PANEL  = '#080d17'
+GOLD   = '#f7c948'
+ORANGE = '#f4845f'
+TEAL   = '#2ec4b6'
+BLUE   = '#3a86ff'
+PURPLE = '#9b72cf'
+GREY   = '#4a5568'
+DIM    = '#2d3748'
+TEXT   = '#cbd5e0'
+WHITE  = '#f7fafc'
+RED    = '#e53e3e'
+GREEN  = '#48bb78'
+ 
+# -------------------------------------------------------------------
+# simulation parameters
+# -------------------------------------------------------------------
+# trial structure: cue at t=0, reward at t=T_reward
+# I'm using 3 different reward delays to show how the ramp scales
+T_CUE    = 0       # ms
+T_DELAYS = [1000, 2000, 4000]   # short / medium / long delay
+DT       = 5       # ms resolution
+ 
+# number of simulated DA neurons (ventral striatum / NAc recordings)
+N_NEURONS = 30
+ 
+# -------------------------------------------------------------------
+# signal generation
+# -------------------------------------------------------------------
+ 
+def make_ramp(t_reward, noise_level=0.04, neuron_idx=0):
+    """
+    Generates a single-trial dopamine ramp signal.
+ 
+    The ramp rises roughly linearly from cue to reward,
+    then drops at reward delivery (consumed by the RPE burst).
+    Different neurons have slightly different slopes and onset latencies —
+    that's the biological reality from Howe et al. 2013.
+    """
+    rng  = np.random.default_rng(seed=neuron_idx * 7 + t_reward)
+    t    = np.arange(0, t_reward + 500, DT)
+ 
+    # individual neuron variation: onset jitter + slope variability
+    onset_delay = rng.integers(80, 250)      # ramp doesn't start instantly
+    slope_scale = rng.uniform(0.55, 1.45)    # some neurons ramp steeper
+ 
+    sig = np.zeros(len(t))
+    ramp_start = np.searchsorted(t, onset_delay)
+    ramp_end   = np.searchsorted(t, t_reward)
+ 
+    if ramp_end > ramp_start:
+        ramp_len = ramp_end - ramp_start
+        # slightly nonlinear — accelerates near reward
+        ramp_vals = np.linspace(0, 1, ramp_len) ** 0.85 * slope_scale
+        sig[ramp_start:ramp_end] = ramp_vals
+ 
+    # reward delivery: brief phasic burst then return to baseline
+    burst_end = min(ramp_end + int(150 / DT), len(t))
+    if burst_end > ramp_end:
+        burst_t  = np.linspace(0, 1, burst_end - ramp_end)
+        sig[ramp_end:burst_end] = slope_scale * np.exp(-burst_t * 4) * 0.6
+ 
+    # baseline tonic + noise
+    baseline = 0.12 + rng.uniform(-0.03, 0.03)
+    sig      = sig + baseline + rng.normal(0, noise_level, len(sig))
+ 
+    return t, np.clip(sig, 0, None)
+ 
+ 
+def make_population_average(t_reward, n=N_NEURONS):
+    """Average across n neurons — smooths out individual variability."""
+    signals = []
+    for i in range(n):
+        t, s = make_ramp(t_reward, noise_level=0.025, neuron_idx=i)
+        signals.append(s)
+    arr = np.array(signals)
+    return t, arr.mean(axis=0), arr.std(axis=0)
+ 
+ 
+def make_raster(t_reward, n=N_NEURONS):
+    """
+    Convert the continuous ramp signal into spike times via
+    inhomogeneous Poisson process — firing probability scales with signal.
+    This is how the underlying physiology actually works.
+    """
+    all_spikes = []
+    for i in range(n):
+        t, sig = make_ramp(t_reward, noise_level=0.02, neuron_idx=i)
+        rng    = np.random.default_rng(seed=i * 13 + t_reward)
+        # scale signal to firing rate: baseline ~5Hz, peak ~30Hz
+        rate   = sig * 28 + 4    # Hz
+        prob   = rate * DT / 1000.0   # prob per bin
+        spikes = t[rng.random(len(t)) < prob]
+        all_spikes.append(spikes)
+    return all_spikes
+ 
+ 
+def make_timing_comparison():
+    """
+    The ramp slope adapts to the expected delay —
+    steeper for short delays, shallower for long ones.
+    Normalised to same endpoint so you can compare shapes.
+    """
+    results = {}
+    for td in T_DELAYS:
+        t, avg, std = make_population_average(td)
+        # normalise time axis to 0–1
+        t_norm = t / td
+        results[td] = (t_norm, avg, std)
+    return results
+ 
+ 
+# -------------------------------------------------------------------
+# figure setup
+# -------------------------------------------------------------------
+fig = plt.figure(figsize=(16, 10), facecolor=BG)
+fig.canvas.manager.set_window_title(
+    'Dopamine Anticipatory Ramp — Cue to Reward Interval'
+)
+ 
+outer = gridspec.GridSpec(
+    3, 1, figure=fig,
+    height_ratios=[0.07, 0.86, 0.07],
+    hspace=0.12,
+    left=0.05, right=0.97, top=0.95, bottom=0.03
+)
+ 
+# header
+ax_hdr = fig.add_subplot(outer[0])
+ax_hdr.set_facecolor(BG); ax_hdr.axis('off')
+ax_hdr.text(0, 0.78, 'DOPAMINE ANTICIPATORY RAMP',
+            color=WHITE, fontsize=17, fontweight='bold',
+            fontfamily='monospace', transform=ax_hdr.transAxes)
+ax_hdr.text(0, 0.12,
+            'Nucleus Accumbens  ·  Ventral Striatum  ·  '
+            'Howe et al. (2013)  ·  Niv et al. (2007)  ·  Schultz (1998)',
+            color=DIM, fontsize=8.5, fontfamily='monospace',
+            transform=ax_hdr.transAxes)
+ 
+# 2x3 content grid
+inner = gridspec.GridSpecFromSubplotSpec(
+    2, 3,
+    subplot_spec=outer[1],
+    hspace=0.54, wspace=0.38,
+    height_ratios=[1, 1]
+)
+ 
+ax_single   = fig.add_subplot(inner[0, 0])   # single trial ramp
+ax_raster   = fig.add_subplot(inner[0, 1])   # spike raster
+ax_pop      = fig.add_subplot(inner[0, 2])   # population average
+ax_timing   = fig.add_subplot(inner[1, 0])   # delay comparison
+ax_heatmap  = fig.add_subplot(inner[1, 1])   # trial-by-trial heatmap
+ax_info     = fig.add_subplot(inner[1, 2])   # explanation
+ 
+for ax in [ax_single, ax_raster, ax_pop, ax_timing, ax_heatmap, ax_info]:
+    ax.set_facecolor(PANEL)
+    for sp in ax.spines.values():
+        sp.set_color(DIM); sp.set_linewidth(0.6)
+ 
+ 
+# -------------------------------------------------------------------
+# drawing functions
+# -------------------------------------------------------------------
+ 
+def draw_single(t_reward):
+    ax_single.cla()
+    ax_single.set_facecolor(PANEL)
+    for sp in ax_single.spines.values(): sp.set_color(DIM); sp.set_linewidth(0.6)
+ 
+    # show 5 individual neurons to give a sense of variability
+    for i in range(5):
+        t, sig = make_ramp(t_reward, noise_level=0.035, neuron_idx=i)
+        alpha  = 0.35 + i * 0.06
+        ax_single.plot(t, sig, color=GOLD, linewidth=0.9, alpha=alpha)
+ 
+    # population mean on top
+    t, avg, std = make_population_average(t_reward)
+    ax_single.fill_between(t, avg - std * 0.5, avg + std * 0.5,
+                            color=GOLD, alpha=0.12)
+    ax_single.plot(t, avg, color=GOLD, linewidth=2.2, label='Population mean')
+ 
+    # markers
+    ax_single.axvline(T_CUE, color=TEAL, linewidth=1.4, linestyle='--', alpha=0.85)
+    ax_single.axvline(t_reward, color=ORANGE, linewidth=1.4, linestyle='--', alpha=0.85)
+    ax_single.text(T_CUE + 20, ax_single.get_ylim()[1] * 0.92,
+                   'CUE', color=TEAL, fontsize=7, fontfamily='monospace')
+    ax_single.text(t_reward + 20, ax_single.get_ylim()[1] * 0.92,
+                   'REWARD', color=ORANGE, fontsize=7, fontfamily='monospace')
+ 
+    ax_single.set_xlabel('Time (ms)', color=TEXT, fontsize=8, fontfamily='monospace')
+    ax_single.set_ylabel('DA signal (norm.)', color=TEXT, fontsize=8, fontfamily='monospace')
+    ax_single.set_title('Single Trial — DA Ramp (5 neurons + mean)',
+                        color=WHITE, fontsize=9, fontfamily='monospace', pad=6)
+    ax_single.tick_params(colors=TEXT, labelsize=7)
+    ax_single.legend(fontsize=7, facecolor=BG, edgecolor=DIM, labelcolor=TEXT)
+ 
+ 
+def draw_raster(t_reward):
+    ax_raster.cla()
+    ax_raster.set_facecolor(PANEL)
+    for sp in ax_raster.spines.values(): sp.set_color(DIM); sp.set_linewidth(0.6)
+ 
+    spikes_all = make_raster(t_reward)
+ 
+    for i, spikes in enumerate(spikes_all):
+        # color spikes by their timing: ramp period gets warmer color
+        colors = []
+        for s in spikes:
+            if s < T_CUE + 80:
+                colors.append(GREY)
+            elif s < t_reward:
+                # gradient along ramp: early=blue, late=gold
+                frac = (s - T_CUE) / (t_reward - T_CUE)
+                r = int(0x3a + frac * (0xf7 - 0x3a))
+                g = int(0x86 + frac * (0xc9 - 0x86))
+                b = int(0xff + frac * (0x48 - 0xff))
+                colors.append(f'#{r:02x}{g:02x}{b:02x}')
+            else:
+                colors.append(ORANGE)
+        ax_raster.vlines(spikes, i + 0.08, i + 0.88,
+                         colors=colors, linewidth=0.85, alpha=0.9)
+ 
+    ax_raster.axvline(T_CUE, color=TEAL, linewidth=1.2, linestyle='--', alpha=0.7)
+    ax_raster.axvline(t_reward, color=ORANGE, linewidth=1.2, linestyle='--', alpha=0.7)
+ 
+    ax_raster.set_xlim(-100, t_reward + 400)
+    ax_raster.set_ylim(0, N_NEURONS)
+    ax_raster.set_xlabel('Time (ms)', color=TEXT, fontsize=8, fontfamily='monospace')
+    ax_raster.set_ylabel('Neuron #  (NAc / VS)', color=TEXT, fontsize=8, fontfamily='monospace')
+    ax_raster.set_title('Spike Raster — Colour Encodes Ramp Phase',
+                        color=WHITE, fontsize=9, fontfamily='monospace', pad=6)
+    ax_raster.tick_params(colors=TEXT, labelsize=7)
+ 
+    patches = [
+        mpatches.Patch(color=BLUE,   label='Early ramp'),
+        mpatches.Patch(color=GOLD,   label='Late ramp'),
+        mpatches.Patch(color=ORANGE, label='Reward delivery'),
+        mpatches.Patch(color=GREY,   label='Baseline'),
+    ]
+    ax_raster.legend(handles=patches, fontsize=6.5, ncol=2,
+                     facecolor=BG, edgecolor=DIM, labelcolor=TEXT)
+ 
+ 
+def draw_population(t_reward):
+    ax_pop.cla()
+    ax_pop.set_facecolor(PANEL)
+    for sp in ax_pop.spines.values(): sp.set_color(DIM); sp.set_linewidth(0.6)
+ 
+    t, avg, std = make_population_average(t_reward, n=N_NEURONS)
+ 
+    ax_pop.fill_between(t, avg - std, avg + std, color=GOLD, alpha=0.10, label='±1 SD')
+    ax_pop.fill_between(t, avg - std * 0.5, avg + std * 0.5,
+                        color=GOLD, alpha=0.18, label='±0.5 SD')
+    ax_pop.plot(t, avg, color=GOLD, linewidth=2.4, label=f'Mean  (n={N_NEURONS})')
+ 
+    # fit a line to the ramp portion to show linearity
+    ramp_mask = (t > 200) & (t < t_reward - 100)
+    if ramp_mask.sum() > 5:
+        coeffs  = np.polyfit(t[ramp_mask], avg[ramp_mask], 1)
+        t_fit   = t[ramp_mask]
+        ax_pop.plot(t_fit, np.polyval(coeffs, t_fit),
+                    color=TEAL, linewidth=1.2, linestyle='--',
+                    alpha=0.7, label=f'Linear fit  (slope={coeffs[0]*1000:.3f}/s)')
+ 
+    ax_pop.axvline(T_CUE, color=TEAL, linewidth=1.3, linestyle='--', alpha=0.8)
+    ax_pop.axvline(t_reward, color=ORANGE, linewidth=1.3, linestyle='--', alpha=0.8)
+ 
+    ax_pop.set_xlabel('Time (ms)', color=TEXT, fontsize=8, fontfamily='monospace')
+    ax_pop.set_ylabel('Mean DA signal', color=TEXT, fontsize=8, fontfamily='monospace')
+    ax_pop.set_title(f'Population Average  (delay = {t_reward}ms)',
+                     color=WHITE, fontsize=9, fontfamily='monospace', pad=6)
+    ax_pop.tick_params(colors=TEXT, labelsize=7)
+    ax_pop.legend(fontsize=7, facecolor=BG, edgecolor=DIM, labelcolor=TEXT)
+ 
+ 
+def draw_timing_comparison():
+    ax_timing.cla()
+    ax_timing.set_facecolor(PANEL)
+    for sp in ax_timing.spines.values(): sp.set_color(DIM); sp.set_linewidth(0.6)
+ 
+    colors  = [BLUE, GOLD, ORANGE]
+    results = make_timing_comparison()
+ 
+    for (td, (t_norm, avg, std)), col in zip(results.items(), colors):
+        # only plot up to reward (t_norm <= 1)
+        mask = t_norm <= 1.02
+        ax_timing.fill_between(t_norm[mask], (avg - std * 0.4)[mask],
+                               (avg + std * 0.4)[mask], color=col, alpha=0.10)
+        ax_timing.plot(t_norm[mask], avg[mask], color=col, linewidth=1.8,
+                       label=f'{td}ms delay')
+ 
+    ax_timing.axvline(0, color=TEAL,   linewidth=1.1, linestyle='--', alpha=0.6)
+    ax_timing.axvline(1, color=ORANGE, linewidth=1.1, linestyle='--', alpha=0.6)
+    ax_timing.text(0.01, 0.95, 'CUE',    color=TEAL,   fontsize=7,
+                   fontfamily='monospace', transform=ax_timing.transAxes)
+    ax_timing.text(0.88, 0.95, 'REWARD', color=ORANGE, fontsize=7,
+                   fontfamily='monospace', transform=ax_timing.transAxes)
+ 
+    ax_timing.set_xlabel('Normalised time (cue=0, reward=1)',
+                         color=TEXT, fontsize=8, fontfamily='monospace')
+    ax_timing.set_ylabel('DA signal', color=TEXT, fontsize=8, fontfamily='monospace')
+    ax_timing.set_title('Ramp Shape Across Delay Durations',
+                        color=WHITE, fontsize=9, fontfamily='monospace', pad=6)
+    ax_timing.tick_params(colors=TEXT, labelsize=7)
+    ax_timing.legend(fontsize=7, facecolor=BG, edgecolor=DIM, labelcolor=TEXT)
+    # note: ramps converge to same endpoint regardless of delay
+    ax_timing.text(0.35, 0.15,
+                   'Ramp endpoint fixed at reward;\nslope adapts to interval length.',
+                   color=GREY, fontsize=7, fontfamily='monospace',
+                   transform=ax_timing.transAxes,
+                   bbox=dict(boxstyle='round,pad=0.3', facecolor=BG,
+                             edgecolor=DIM, linewidth=0.7))
+ 
+ 
+def draw_heatmap(t_reward, n_trials=25):
+    ax_heatmap.cla()
+    ax_heatmap.set_facecolor(PANEL)
+    for sp in ax_heatmap.spines.values(): sp.set_color(DIM); sp.set_linewidth(0.6)
+ 
+    # trial-by-trial variability in the ramp
+    # rows = trials, columns = time bins
+    t_ref = np.arange(0, t_reward + 200, DT * 4)   # coarser for heatmap
+    matrix = np.zeros((n_trials, len(t_ref)))
+ 
+    rng = np.random.default_rng(seed=99)
+    for trial in range(n_trials):
+        # each trial: slightly different reward time (timing uncertainty)
+        jitter  = rng.integers(-80, 80)
+        td_jit  = max(t_reward + jitter, 400)
+        _, sig  = make_ramp(td_jit, noise_level=0.04, neuron_idx=trial + 50)
+        # interpolate to common time axis
+        t_trial = np.arange(0, td_jit + 200, DT)
+        interp  = np.interp(t_ref, t_trial, sig,
+                            left=sig[0], right=sig[-1])
+        matrix[trial] = interp
+ 
+    from matplotlib.colors import LinearSegmentedColormap
+    cmap = LinearSegmentedColormap.from_list(
+        'ramp_heat', [BG, '#0d2137', BLUE, TEAL, GOLD, ORANGE], N=256
+    )
+    im = ax_heatmap.imshow(matrix, aspect='auto', cmap=cmap,
+                           vmin=0, vmax=1.0, interpolation='bilinear',
+                           extent=[t_ref[0], t_ref[-1], n_trials, 0])
+ 
+    ax_heatmap.axvline(T_CUE, color=TEAL,   linewidth=1.2, linestyle='--', alpha=0.7)
+    ax_heatmap.axvline(t_reward, color=ORANGE, linewidth=1.2, linestyle='--', alpha=0.7)
+ 
+    ax_heatmap.set_xlabel('Time (ms)', color=TEXT, fontsize=8, fontfamily='monospace')
+    ax_heatmap.set_ylabel('Trial #', color=TEXT, fontsize=8, fontfamily='monospace')
+    ax_heatmap.set_title('Trial-by-Trial Ramp Variability',
+                         color=WHITE, fontsize=9, fontfamily='monospace', pad=6)
+    ax_heatmap.tick_params(colors=TEXT, labelsize=7)
+ 
+    cbar = plt.colorbar(im, ax=ax_heatmap, fraction=0.04, pad=0.02)
+    cbar.ax.tick_params(colors=TEXT, labelsize=6)
+    cbar.set_label('DA signal', color=TEXT, fontsize=7, fontfamily='monospace')
+ 
+ 
+def draw_info(t_reward):
+    ax_info.cla()
+    ax_info.set_facecolor(PANEL)
+    for sp in ax_info.spines.values(): sp.set_color(DIM); sp.set_linewidth(0.6)
+    ax_info.axis('off')
+    ax_info.set_title('What This Signal Means', color=WHITE, fontsize=9,
+                      fontfamily='monospace', pad=6)
+ 
+    notes = [
+        (GOLD,   'THE RAMP ≠ PHASIC RPE',
+                 f'RPE is a sharp burst at reward.\nThe ramp is a slow build during\nthe {t_reward}ms wait — different\nmechanism, different function.'),
+        (TEAL,   'THREE COMPETING THEORIES',
+                 'Time encoding (counting down),\nproximity to reward (distance),\nor integrated value estimate.\nStill debated as of 2024.'),
+        (ORANGE, 'KEY PAPER — HOWE 2013',
+                 'Measured with fast-scan cyclic\nvoltammetry in freely moving rats.\nFirst clean in-vivo demonstration\nof the ramp in NAc core.'),
+    ]
+ 
+    y = 0.94
+    for col, title, body in notes:
+        ax_info.text(0.04, y, f'▸ {title}', color=col, fontsize=7.5,
+                     fontweight='bold', fontfamily='monospace',
+                     transform=ax_info.transAxes, va='top')
+        ax_info.text(0.04, y - 0.065, body, color=TEXT, fontsize=7.2,
+                     fontfamily='monospace', transform=ax_info.transAxes,
+                     va='top', linespacing=1.55)
+        y -= 0.30
+ 
+ 
+# -------------------------------------------------------------------
+# interactive delay slider + buttons
+# -------------------------------------------------------------------
+state = dict(delay=T_DELAYS[1])   # default: 2000ms
+ 
+ 
+def redraw():
+    td = state['delay']
+    draw_single(td)
+    draw_raster(td)
+    draw_population(td)
+    draw_timing_comparison()
+    draw_heatmap(td)
+    draw_info(td)
+    fig.canvas.draw_idle()
+ 
+ 
+btn_row = gridspec.GridSpecFromSubplotSpec(
+    1, 4, subplot_spec=outer[2], wspace=0.06
+)
+ax_b = [fig.add_subplot(btn_row[i]) for i in range(4)]
+ 
+btn_short   = Button(ax_b[0], '1s DELAY',  color='#0a1628', hovercolor='#142040')
+btn_medium  = Button(ax_b[1], '2s DELAY',  color='#0a1628', hovercolor='#142040')
+btn_long    = Button(ax_b[2], '4s DELAY',  color='#0a1628', hovercolor='#142040')
+btn_save    = Button(ax_b[3], 'SAVE PNG',  color='#001a0e', hovercolor='#003020')
+ 
+for btn in [btn_short, btn_medium, btn_long, btn_save]:
+    btn.label.set_color(TEXT)
+    btn.label.set_fontsize(8)
+    btn.label.set_fontfamily('monospace')
+ 
+ 
+def set_delay(td):
+    state['delay'] = td
+    redraw()
+ 
+ 
+btn_short.on_clicked(lambda e: set_delay(1000))
+btn_medium.on_clicked(lambda e: set_delay(2000))
+btn_long.on_clicked(lambda e: set_delay(4000))
+ 
+ 
+def save_png(event=None):
+    fname = f'dopamine_ramp_{state["delay"]}ms.png'
+    fig.savefig(fname, dpi=150, bbox_inches='tight',
+                facecolor=fig.get_facecolor())
+    print(f'Saved: {fname}')
+ 
+ 
+btn_save.on_clicked(save_png)
+ 
+# -------------------------------------------------------------------
+# go
+# -------------------------------------------------------------------
+redraw()
+ 
+plt.savefig('dopamine_ramp_anticipation.png', dpi=150,
+            bbox_inches='tight', facecolor=fig.get_facecolor())
+print('Saved: dopamine_ramp_anticipation.png')
+plt.show()

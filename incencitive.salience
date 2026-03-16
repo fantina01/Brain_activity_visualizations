@@ -1,0 +1,449 @@
+import numpy as np
+import matplotlib.pyplot as plt
+import matplotlib.gridspec as gridspec
+import matplotlib.patches as mpatches
+from matplotlib.patches import FancyBboxPatch, FancyArrowPatch
+from matplotlib.colors import LinearSegmentedColormap
+import matplotlib.patheffects as pe
+from matplotlib.widgets import Button
+ 
+np.random.seed(21)
+ 
+# -------------------------------------------------------------------
+# colours
+# -------------------------------------------------------------------
+BG     = '#04080f'
+PANEL  = '#080d17'
+WANT   = '#e05c1a'   # orange-red — wanting / DA
+LIKE   = '#4cc9f0'   # sky blue  — liking / opioid
+BOTH   = '#c77dff'   # purple    — both active
+NONE   = '#3d5a6b'   # grey      — neither
+GOLD   = '#ffd166'
+GREEN  = '#52b788'
+DIM    = '#2d3748'
+TEXT   = '#cbd5e0'
+WHITE  = '#f7fafc'
+GREY   = '#4a5568'
+ 
+# -------------------------------------------------------------------
+# data: 4 dissociation conditions (from Berridge lesion / microinjection work)
+# -------------------------------------------------------------------
+CONDITIONS = [
+    dict(
+        name    = 'Normal',
+        wanting = 0.80,
+        liking  = 0.75,
+        color   = BOTH,
+        desc    = 'Both systems intact.\nWanting and liking track\ntogether as expected.',
+    ),
+    dict(
+        name    = 'DA Depletion\n(6-OHDA)',
+        wanting = 0.08,
+        liking  = 0.72,
+        color   = LIKE,
+        desc    = 'Dopamine depleted\n(up to 99% in NAc).\nLiking preserved — rats\nstill show hedonic\nreactions to sucrose.\nBut they stop working\nfor it. Wanting gone.',
+    ),
+    dict(
+        name    = 'DA Supersensitivity\n(amphetamine)',
+        wanting = 0.95,
+        liking  = 0.40,
+        color   = WANT,
+        desc    = 'DA system amplified.\nWanting is intense —\ncompulsive seeking.\nHedonic impact\ndoes NOT increase.\nThe high is about\nurge, not pleasure.',
+    ),
+    dict(
+        name    = 'Opioid Hotspot\nActivation',
+        wanting = 0.60,
+        liking  = 0.95,
+        color   = LIKE,
+        desc    = 'Mu-opioid agonist in\nrostral NAc shell.\nLiking sharply elevated\n(enhanced hedonic\nreactions to sucrose).\nWanting increases\nmodestly.',
+    ),
+    dict(
+        name    = 'Addiction Model',
+        wanting = 0.98,
+        liking  = 0.25,
+        color   = WANT,
+        desc    = 'Sensitised DA system\nafter repeated drug\nexposure. Craving\nintense; actual\npleasure blunted.\nCore of addiction\nmechanics.',
+    ),
+]
+ 
+# time series: simulated neural activity traces for wanting vs liking
+# under each condition
+T_TRIAL = np.linspace(0, 2000, 1000)   # 2 second trial
+T_CUE   = 400     # reward cue onset
+T_REW   = 1200    # reward delivery
+ 
+ 
+def make_wanting_trace(scale, noise=0.03):
+    rng = np.random.default_rng(seed=int(scale * 1000))
+    sig = np.zeros_like(T_TRIAL)
+    # phasic burst at cue (incentive salience assigned at cue, not reward)
+    mask_cue = (T_TRIAL > T_CUE) & (T_TRIAL < T_CUE + 200)
+    t_rel     = T_TRIAL[mask_cue] - T_CUE
+    sig[mask_cue] = scale * np.exp(-t_rel / 60) * np.clip(t_rel / 25, 0, 1)
+    # ramp between cue and reward
+    mask_ramp = (T_TRIAL > T_CUE + 180) & (T_TRIAL < T_REW)
+    t_ramp    = T_TRIAL[mask_ramp]
+    sig[mask_ramp] = scale * 0.35 * ((t_ramp - T_CUE) / (T_REW - T_CUE)) ** 0.9
+    # small signal at reward itself
+    mask_rew  = (T_TRIAL > T_REW) & (T_TRIAL < T_REW + 150)
+    t_rel2    = T_TRIAL[mask_rew] - T_REW
+    sig[mask_rew] = scale * 0.25 * np.exp(-t_rel2 / 50)
+    return sig + rng.normal(0, noise, len(sig))
+ 
+ 
+def make_liking_trace(scale, noise=0.03):
+    rng = np.random.default_rng(seed=int(scale * 777) + 1)
+    sig = np.zeros_like(T_TRIAL)
+    # liking activates AT reward, not at cue
+    mask_rew = (T_TRIAL > T_REW) & (T_TRIAL < T_REW + 400)
+    t_rel    = T_TRIAL[mask_rew] - T_REW
+    sig[mask_rew] = scale * np.exp(-t_rel / 150) * np.clip(t_rel / 40, 0, 1)
+    return sig + rng.normal(0, noise, len(sig))
+ 
+ 
+# NAc anatomy data — hotspot coordinates (simplified 2D projection)
+# Berridge's hedonic hotspot is ~1 cubic mm in rostral NAc shell
+NAC_REGIONS = [
+    dict(name='NAc Core',           x=0.50, y=0.55, r=0.16,
+         da_dense=True,  opioid=False, role='wanting'),
+    dict(name='NAc Shell\n(caudal)', x=0.35, y=0.40, r=0.12,
+         da_dense=True,  opioid=False, role='wanting'),
+    dict(name='NAc Shell\n(rostral\nhotspot)', x=0.55, y=0.30, r=0.07,
+         da_dense=False, opioid=True,  role='liking'),
+    dict(name='VP Hotspot',          x=0.72, y=0.45, r=0.05,
+         da_dense=False, opioid=True,  role='liking'),
+]
+ 
+# -------------------------------------------------------------------
+# figure
+# -------------------------------------------------------------------
+fig = plt.figure(figsize=(16, 10), facecolor=BG)
+fig.canvas.manager.set_window_title(
+    'Incentive Salience — Wanting vs Liking Dissociation'
+)
+ 
+outer = gridspec.GridSpec(
+    3, 1, figure=fig,
+    height_ratios=[0.07, 0.86, 0.07],
+    hspace=0.10,
+    left=0.05, right=0.97, top=0.95, bottom=0.03
+)
+ 
+ax_hdr = fig.add_subplot(outer[0])
+ax_hdr.set_facecolor(BG); ax_hdr.axis('off')
+ax_hdr.text(0, 0.78, 'INCENTIVE SALIENCE  —  WANTING  vs  LIKING',
+            color=WHITE, fontsize=16, fontweight='bold',
+            fontfamily='monospace', transform=ax_hdr.transAxes)
+ax_hdr.text(0, 0.12,
+            'Nucleus Accumbens  ·  Dopamine vs Opioid Systems  ·  '
+            'Berridge & Robinson (1998, 2003, 2007)  ·  Peciña & Berridge (2005)',
+            color=DIM, fontsize=8.5, fontfamily='monospace',
+            transform=ax_hdr.transAxes)
+ 
+inner = gridspec.GridSpecFromSubplotSpec(
+    2, 3,
+    subplot_spec=outer[1],
+    hspace=0.54, wspace=0.38,
+    height_ratios=[1, 1]
+)
+ 
+ax_dissoc  = fig.add_subplot(inner[0, 0])   # wanting vs liking scatter
+ax_traces  = fig.add_subplot(inner[0, 1])   # neural traces
+ax_nac     = fig.add_subplot(inner[0, 2])   # NAc anatomy diagram
+ax_bars    = fig.add_subplot(inner[1, 0])   # condition comparison bars
+ax_matrix  = fig.add_subplot(inner[1, 1])   # dissociation matrix
+ax_info    = fig.add_subplot(inner[1, 2])   # description
+ 
+for ax in [ax_dissoc, ax_traces, ax_nac, ax_bars, ax_matrix, ax_info]:
+    ax.set_facecolor(PANEL)
+    for sp in ax.spines.values():
+        sp.set_color(DIM); sp.set_linewidth(0.6)
+ 
+# -------------------------------------------------------------------
+# drawing functions
+# -------------------------------------------------------------------
+ 
+def draw_dissociation(cond_idx):
+    ax_dissoc.cla()
+    ax_dissoc.set_facecolor(PANEL)
+    for sp in ax_dissoc.spines.values(): sp.set_color(DIM); sp.set_linewidth(0.6)
+ 
+    # plot all conditions as scatter
+    for i, c in enumerate(CONDITIONS):
+        is_sel = (i == cond_idx)
+        size   = 140 if is_sel else 55
+        alpha  = 1.0 if is_sel else 0.45
+        zorder = 5 if is_sel else 3
+        ax_dissoc.scatter(c['wanting'], c['liking'],
+                          color=c['color'], s=size, alpha=alpha,
+                          zorder=zorder, edgecolors=WHITE if is_sel else 'none',
+                          linewidths=1.5)
+        offset_x = 0.03 if c['wanting'] < 0.85 else -0.04
+        offset_y = 0.03
+        short = c['name'].split('\n')[0]
+        ax_dissoc.text(c['wanting'] + offset_x, c['liking'] + offset_y,
+                       short, color=TEXT if not is_sel else WHITE,
+                       fontsize=6.5 if not is_sel else 7.5,
+                       fontfamily='monospace',
+                       fontweight='bold' if is_sel else 'normal',
+                       alpha=0.6 if not is_sel else 1.0)
+ 
+    # identity line (wanting == liking)
+    ax_dissoc.plot([0, 1], [0, 1], color=GREY, linewidth=0.8,
+                  linestyle='--', alpha=0.4, label='Wanting = Liking')
+    ax_dissoc.axvline(0.5, color=DIM, linewidth=0.5, alpha=0.3)
+    ax_dissoc.axhline(0.5, color=DIM, linewidth=0.5, alpha=0.3)
+ 
+    # quadrant labels
+    ax_dissoc.text(0.82, 0.12, 'HIGH WANT\nLOW LIKE\n(addiction)', color=WANT,
+                   fontsize=6, fontfamily='monospace', alpha=0.7,
+                   ha='center', va='center')
+    ax_dissoc.text(0.18, 0.85, 'LOW WANT\nHIGH LIKE\n(DA lesion)', color=LIKE,
+                   fontsize=6, fontfamily='monospace', alpha=0.7,
+                   ha='center', va='center')
+ 
+    ax_dissoc.set_xlim(0, 1.1); ax_dissoc.set_ylim(0, 1.1)
+    ax_dissoc.set_xlabel('WANTING  (incentive salience / DA)',
+                         color=WANT, fontsize=8, fontfamily='monospace')
+    ax_dissoc.set_ylabel('LIKING  (hedonic impact / opioid)',
+                         color=LIKE, fontsize=8, fontfamily='monospace')
+    ax_dissoc.set_title('Wanting vs Liking — Dissociation Space',
+                        color=WHITE, fontsize=9, fontfamily='monospace', pad=6)
+    ax_dissoc.tick_params(colors=TEXT, labelsize=7)
+ 
+ 
+def draw_traces(cond_idx):
+    ax_traces.cla()
+    ax_traces.set_facecolor(PANEL)
+    for sp in ax_traces.spines.values(): sp.set_color(DIM); sp.set_linewidth(0.6)
+ 
+    c = CONDITIONS[cond_idx]
+    w = make_wanting_trace(c['wanting'])
+    l = make_liking_trace(c['liking'])
+ 
+    ax_traces.fill_between(T_TRIAL, w, alpha=0.15, color=WANT)
+    ax_traces.fill_between(T_TRIAL, l, alpha=0.15, color=LIKE)
+    ax_traces.plot(T_TRIAL, w, color=WANT, linewidth=2.0,
+                   label=f'Wanting signal  (DA / NAc)  = {c["wanting"]:.2f}')
+    ax_traces.plot(T_TRIAL, l, color=LIKE, linewidth=2.0,
+                   label=f'Liking signal  (Opioid)  = {c["liking"]:.2f}')
+ 
+    ax_traces.axvline(T_CUE, color=GOLD,  linewidth=1.2, linestyle='--', alpha=0.7)
+    ax_traces.axvline(T_REW, color=GREEN, linewidth=1.2, linestyle='--', alpha=0.7)
+    ax_traces.text(T_CUE + 20, ax_traces.get_ylim()[1] * 0.9 + 0.02,
+                   'CUE', color=GOLD, fontsize=7, fontfamily='monospace')
+    ax_traces.text(T_REW + 20, ax_traces.get_ylim()[1] * 0.9 + 0.02,
+                   'REWARD', color=GREEN, fontsize=7, fontfamily='monospace')
+ 
+    ax_traces.set_xlabel('Time (ms)', color=TEXT, fontsize=8, fontfamily='monospace')
+    ax_traces.set_ylabel('Signal magnitude', color=TEXT, fontsize=8, fontfamily='monospace')
+    ax_traces.set_title(f'Neural Traces — {c["name"].split(chr(10))[0]}',
+                        color=WHITE, fontsize=9, fontfamily='monospace', pad=6)
+    ax_traces.tick_params(colors=TEXT, labelsize=7)
+    ax_traces.legend(fontsize=7, facecolor=BG, edgecolor=DIM, labelcolor=TEXT)
+ 
+ 
+def draw_nac():
+    ax_nac.cla()
+    ax_nac.set_facecolor(PANEL)
+    for sp in ax_nac.spines.values(): sp.set_color(DIM); sp.set_linewidth(0.6)
+    ax_nac.axis('off')
+    ax_nac.set_xlim(0, 1); ax_nac.set_ylim(0, 1)
+    ax_nac.set_title('NAc Anatomy — Wanting vs Liking Hotspots',
+                     color=WHITE, fontsize=9, fontfamily='monospace', pad=6)
+ 
+    # rough NAc outline
+    theta = np.linspace(0, 2 * np.pi, 200)
+    ox = 0.50 + 0.28 * np.cos(theta) * (1 + 0.12 * np.cos(2 * theta))
+    oy = 0.44 + 0.24 * np.sin(theta) * (1 + 0.06 * np.sin(theta))
+    ax_nac.fill(ox, oy, color='#0d1f2d', alpha=0.9)
+    ax_nac.plot(ox, oy, color=GREY, linewidth=0.8)
+ 
+    for reg in NAC_REGIONS:
+        col   = WANT if reg['role'] == 'wanting' else LIKE
+        alpha = 0.55 if reg['role'] == 'wanting' else 0.75
+        size_glow = reg['r'] * 2.2
+ 
+        # glow
+        for gr, ga in [(size_glow, 0.06), (size_glow * 1.5, 0.03)]:
+            gc = plt.Circle((reg['x'], reg['y']), gr,
+                            facecolor=col, alpha=ga, zorder=2)
+            ax_nac.add_patch(gc)
+ 
+        circle = plt.Circle((reg['x'], reg['y']), reg['r'],
+                             facecolor=col, alpha=alpha,
+                             edgecolor=col, linewidth=1.2, zorder=3)
+        ax_nac.add_patch(circle)
+ 
+        ax_nac.text(reg['x'], reg['y'] - reg['r'] - 0.05,
+                    reg['name'], color=TEXT, fontsize=6.5,
+                    fontfamily='monospace', ha='center', va='top',
+                    path_effects=[pe.withStroke(linewidth=2, foreground=BG)])
+ 
+    patches = [
+        mpatches.Patch(color=WANT, label='DA-rich  (wanting)'),
+        mpatches.Patch(color=LIKE, label='Opioid hotspot  (liking)'),
+    ]
+    ax_nac.legend(handles=patches, loc='lower center', ncol=2,
+                  fontsize=7, facecolor=BG, edgecolor=DIM, labelcolor=TEXT)
+ 
+ 
+def draw_bars(cond_idx):
+    ax_bars.cla()
+    ax_bars.set_facecolor(PANEL)
+    for sp in ax_bars.spines.values(): sp.set_color(DIM); sp.set_linewidth(0.6)
+ 
+    names   = [c['name'].replace('\n', ' ') for c in CONDITIONS]
+    wanting = [c['wanting'] for c in CONDITIONS]
+    liking  = [c['liking']  for c in CONDITIONS]
+    x       = np.arange(len(CONDITIONS))
+    w       = 0.35
+ 
+    bars_w = ax_bars.bar(x - w/2, wanting, w, color=WANT, alpha=0.80,
+                         linewidth=0, label='Wanting  (DA)')
+    bars_l = ax_bars.bar(x + w/2, liking,  w, color=LIKE, alpha=0.80,
+                         linewidth=0, label='Liking  (Opioid)')
+ 
+    # highlight selected condition
+    bars_w[cond_idx].set_edgecolor(WHITE); bars_w[cond_idx].set_linewidth(1.5)
+    bars_l[cond_idx].set_edgecolor(WHITE); bars_l[cond_idx].set_linewidth(1.5)
+ 
+    ax_bars.set_xticks(x)
+    short_names = [c['name'].split('\n')[0] for c in CONDITIONS]
+    ax_bars.set_xticklabels(short_names, fontsize=6.5,
+                            fontfamily='monospace', color=TEXT, rotation=12)
+    ax_bars.set_ylabel('Signal strength', color=TEXT, fontsize=8, fontfamily='monospace')
+    ax_bars.set_title('Wanting vs Liking Across Conditions',
+                      color=WHITE, fontsize=9, fontfamily='monospace', pad=6)
+    ax_bars.tick_params(colors=TEXT, labelsize=7)
+    ax_bars.set_ylim(0, 1.15)
+    ax_bars.legend(fontsize=7, facecolor=BG, edgecolor=DIM, labelcolor=TEXT)
+ 
+ 
+def draw_matrix():
+    ax_matrix.cla()
+    ax_matrix.set_facecolor(PANEL)
+    for sp in ax_matrix.spines.values(): sp.set_color(DIM); sp.set_linewidth(0.6)
+ 
+    # 2×2 dissociation matrix — the conceptual core of Berridge's framework
+    ax_matrix.set_xlim(0, 2); ax_matrix.set_ylim(0, 2)
+    ax_matrix.set_xticks([0.5, 1.5])
+    ax_matrix.set_yticks([0.5, 1.5])
+    ax_matrix.set_xticklabels(['DA Low', 'DA High'],
+                               color=WANT, fontsize=8.5, fontfamily='monospace')
+    ax_matrix.set_yticklabels(['Opioid Low', 'Opioid High'],
+                               color=LIKE, fontsize=8.5, fontfamily='monospace')
+    ax_matrix.set_title('Dissociation Matrix', color=WHITE, fontsize=9,
+                        fontfamily='monospace', pad=6)
+    ax_matrix.tick_params(colors=TEXT, labelsize=8, length=0)
+    ax_matrix.axvline(1, color=DIM, linewidth=1.0)
+    ax_matrix.axhline(1, color=DIM, linewidth=1.0)
+ 
+    cells = [
+        (0.50, 0.50, GREY,  'No wanting\nNo liking\n(flat affect)'),
+        (1.50, 0.50, WANT,  'High wanting\nNo liking\n(addiction)'),
+        (0.50, 1.50, LIKE,  'No wanting\nHigh liking\n(DA depletion)'),
+        (1.50, 1.50, BOTH,  'High wanting\nHigh liking\n(normal reward)'),
+    ]
+    for cx, cy, col, label in cells:
+        r, g, b = int(col[1:3], 16)/255, int(col[3:5], 16)/255, int(col[5:7], 16)/255
+        rect = plt.Rectangle((cx - 0.48, cy - 0.48), 0.96, 0.96,
+                              facecolor=(r, g, b, 0.18),
+                              edgecolor=col, linewidth=0.8)
+        ax_matrix.add_patch(rect)
+        ax_matrix.text(cx, cy, label, color=TEXT, fontsize=7.5,
+                       fontfamily='monospace', ha='center', va='center',
+                       linespacing=1.5)
+ 
+ 
+def draw_info(cond_idx):
+    ax_info.cla()
+    ax_info.set_facecolor(PANEL)
+    for sp in ax_info.spines.values(): sp.set_color(DIM); sp.set_linewidth(0.6)
+    ax_info.axis('off')
+ 
+    c = CONDITIONS[cond_idx]
+    ax_info.set_title(c['name'].replace('\n', ' '), color=WHITE, fontsize=9,
+                      fontfamily='monospace', pad=6)
+ 
+    ax_info.text(0.04, 0.93, c['desc'], color=TEXT, fontsize=8,
+                 fontfamily='monospace', transform=ax_info.transAxes,
+                 va='top', linespacing=1.65,
+                 bbox=dict(boxstyle='round,pad=0.5', facecolor=BG,
+                           edgecolor=DIM, linewidth=0.8))
+ 
+    key_point = (
+        "KEY INSIGHT:\n"
+        "Dopamine does not cause\n"
+        "pleasure. It causes the\n"
+        "urge to seek. Pleasure\n"
+        "is a separate opioid\n"
+        "phenomenon in a much\n"
+        "smaller brain region."
+    )
+    ax_info.text(0.04, 0.35, key_point, color=WANT, fontsize=7.5,
+                 fontfamily='monospace', transform=ax_info.transAxes,
+                 va='top', linespacing=1.5,
+                 bbox=dict(boxstyle='round,pad=0.5', facecolor='#1a0500',
+                           edgecolor=WANT, linewidth=0.8))
+ 
+ 
+# -------------------------------------------------------------------
+# state + buttons
+# -------------------------------------------------------------------
+state = dict(condition=0)
+ 
+ 
+def redraw():
+    ci = state['condition']
+    draw_dissociation(ci)
+    draw_traces(ci)
+    draw_nac()
+    draw_bars(ci)
+    draw_matrix()
+    draw_info(ci)
+    fig.canvas.draw_idle()
+ 
+ 
+btn_row = gridspec.GridSpecFromSubplotSpec(
+    1, len(CONDITIONS) + 1,
+    subplot_spec=outer[2], wspace=0.05
+)
+ax_b = [fig.add_subplot(btn_row[i]) for i in range(len(CONDITIONS) + 1)]
+ 
+btns = []
+for i, (ab, c) in enumerate(zip(ax_b[:-1], CONDITIONS)):
+    lbl = c['name'].split('\n')[0][:16]
+    b   = Button(ab, lbl, color='#0a1628', hovercolor='#142040')
+    b.label.set_color(TEXT); b.label.set_fontsize(7.5)
+    b.label.set_fontfamily('monospace')
+    btns.append(b)
+ 
+btn_save = Button(ax_b[-1], 'SAVE PNG', color='#001a0e', hovercolor='#003020')
+btn_save.label.set_color(TEXT); btn_save.label.set_fontsize(8)
+btn_save.label.set_fontfamily('monospace')
+ 
+for i in range(len(CONDITIONS)):
+    btns[i].on_clicked(lambda e, idx=i: (state.update(condition=idx), redraw()))
+ 
+ 
+def save_png(event=None):
+    fig.savefig('incentive_salience.png', dpi=150,
+                bbox_inches='tight', facecolor=fig.get_facecolor())
+    print('Saved: incentive_salience.png')
+ 
+ 
+btn_save.on_clicked(save_png)
+ 
+# -------------------------------------------------------------------
+# go
+# -------------------------------------------------------------------
+draw_nac()
+draw_matrix()
+redraw()
+ 
+plt.savefig('incentive_salience.png', dpi=150,
+            bbox_inches='tight', facecolor=fig.get_facecolor())
+print('Saved: incentive_salience.png')
+ 
+plt.show()

@@ -1,0 +1,206 @@
+# File 4: counterfactual_signaling.py
+
+import numpy as np
+import matplotlib.pyplot as plt
+import matplotlib.gridspec as gridspec
+
+plt.rcParams['figure.facecolor'] = 'white'
+plt.rcParams['axes.facecolor'] = 'white'
+plt.rcParams['font.size'] = 10
+
+class CounterfactualSignaling:
+    """Generate alternative hypotheses and compute surprise"""
+    
+    def __init__(self, n_hypotheses=4):
+        self.n_hypotheses = n_hypotheses
+        self.hypotheses = None
+    
+    def generate_hypotheses(self, signal_len, complexity='moderate'):
+        """Generate set of alternative hypotheses"""
+        hypotheses = {}
+        
+        if complexity == 'simple':
+            for i in range(self.n_hypotheses):
+                slope = -0.5 + i * 0.33
+                hyp = slope * np.arange(signal_len) / signal_len
+                hypotheses[f'H{i}'] = hyp
+        
+        elif complexity == 'moderate':
+            freqs = np.linspace(1, 5, self.n_hypotheses)
+            t = np.arange(signal_len)
+            for i, freq in enumerate(freqs):
+                hyp = np.sin(2 * np.pi * freq * t / 512)
+                hypotheses[f'H{i}'] = hyp
+        
+        else:
+            for i in range(self.n_hypotheses):
+                hyp = np.random.randn(signal_len)
+                hyp = np.cumsum(hyp) / np.sqrt(signal_len)
+                hypotheses[f'H{i}'] = hyp
+        
+        self.hypotheses = hypotheses
+        return hypotheses
+    
+    def compute_surprise(self, actual, predicted, window=100):
+        """Surprise = -log P(actual | predicted)"""
+        error = actual - predicted
+        
+        surprise = np.zeros_like(error)
+        for t in range(window, len(error)):
+            window_err = error[t-window:t]
+            var = np.var(window_err)
+            surprise[t] = 0.5 * np.log(2 * np.pi * var + 1e-8) + (error[t]**2) / (2 * var + 1e-8)
+        
+        surprise[:window] = surprise[window]
+        return surprise
+    
+    def compute_model_evidence(self, actual, hypotheses):
+        """Compute likelihood for each hypothesis"""
+        evidence = {}
+        likelihoods = {}
+        
+        for name, hyp in hypotheses.items():
+            error = actual - hyp
+            mse = np.mean(error**2)
+            likelihood = np.exp(-mse)
+            likelihoods[name] = likelihood
+        
+        total = sum(likelihoods.values())
+        evidence = {k: v/total for k, v in likelihoods.items()}
+        
+        return evidence
+    
+    def plot_counterfactuals(self, actual_signal):
+        """Visualize counterfactual hypothesis space"""
+        if self.hypotheses is None:
+            self.generate_hypotheses(len(actual_signal), complexity='moderate')
+        
+        fig = plt.figure(figsize=(14, 10))
+        fig.suptitle('Counterfactual Signaling in Cortex', fontsize=14, fontweight='bold')
+        
+        gs = gridspec.GridSpec(3, 2, figure=fig, hspace=0.35, wspace=0.3)
+        
+        time = np.arange(len(actual_signal))
+        colors = ['#1f77b4', '#ff7f0e', '#2ca02c', '#d62728']
+        
+        # --- Panel 1: Hypotheses vs Actual ---
+        ax1 = fig.add_subplot(gs[0, :])
+        
+        plot_len = min(1000, len(actual_signal))
+        
+        ax1.plot(time[:plot_len], actual_signal[:plot_len], color='black', linewidth=3, 
+                label='Actual Signal', zorder=10)
+        
+        for i, (name, hyp) in enumerate(self.hypotheses.items()):
+            ax1.plot(time[:plot_len], hyp[:plot_len], color=colors[i], linewidth=1.5, 
+                    alpha=0.6, linestyle='--', label=name)
+        
+        ax1.set_ylabel('Signal', fontsize=10)
+        ax1.set_xlim(0, plot_len)
+        ax1.grid(True, alpha=0.2)
+        ax1.legend(loc='upper right', fontsize=9, ncol=3)
+        ax1.set_title('Alternative Hypotheses vs Actual Signal', fontweight='bold')
+        
+        # --- Panel 2: Surprise Heatmap ---
+        ax2 = fig.add_subplot(gs[1, 0])
+        
+        surprises = []
+        for name, hyp in self.hypotheses.items():
+            surp = self.compute_surprise(actual_signal, hyp, window=100)
+            surprises.append(surp)
+        
+        surprises = np.array(surprises)
+        plot_len = min(2000, surprises.shape[1])
+        
+        im2 = ax2.imshow(surprises[:, :plot_len], aspect='auto', cmap='RdYlBu_r', 
+                        origin='lower', extent=[0, plot_len, 0, self.n_hypotheses])
+        ax2.set_ylabel('Hypothesis', fontsize=10)
+        ax2.set_xlabel('Time (samples)', fontsize=10)
+        ax2.set_yticks(np.arange(self.n_hypotheses) + 0.5)
+        ax2.set_yticklabels([f'H{i}' for i in range(self.n_hypotheses)])
+        ax2.set_title('Surprise Across Hypotheses', fontweight='bold')
+        cbar2 = plt.colorbar(im2, ax=ax2)
+        cbar2.set_label('Surprise', fontsize=10)
+        
+        # --- Panel 3: Model Evidence ---
+        ax3 = fig.add_subplot(gs[1, 1])
+        
+        evidence = self.compute_model_evidence(actual_signal, self.hypotheses)
+        hyp_names = list(evidence.keys())
+        hyp_probs = list(evidence.values())
+        
+        bars = ax3.bar(hyp_names, hyp_probs, color=colors[:len(hyp_names)], 
+                      alpha=0.7, edgecolor='black', linewidth=1.5)
+        
+        for bar, prob in zip(bars, hyp_probs):
+            height = bar.get_height()
+            ax3.text(bar.get_x() + bar.get_width()/2., height,
+                    f'{prob:.2f}', ha='center', va='bottom', fontsize=10, fontweight='bold')
+        
+        ax3.set_ylabel('Model Probability', fontsize=10)
+        ax3.set_ylim([0, 1.0])
+        ax3.grid(True, alpha=0.2, axis='y')
+        ax3.set_title('Model Comparison (Evidence)', fontweight='bold')
+        
+        # --- Panel 4: Prediction Errors ---
+        ax4 = fig.add_subplot(gs[2, 0])
+        
+        plot_len = min(1000, len(actual_signal))
+        
+        for i, (name, hyp) in enumerate(self.hypotheses.items()):
+            pe = actual_signal - hyp
+            ax4.plot(time[:plot_len], pe[:plot_len], color=colors[i], linewidth=1.5, 
+                    alpha=0.7, label=name)
+        
+        ax4.axhline(0, color='black', linestyle='-', linewidth=0.5, alpha=0.3)
+        ax4.set_ylabel('Prediction Error', fontsize=10)
+        ax4.set_xlim(0, plot_len)
+        ax4.grid(True, alpha=0.2)
+        ax4.legend(fontsize=8, ncol=2)
+        ax4.set_title('Prediction Errors from Each Model', fontweight='bold')
+        
+        # --- Panel 5: Best-Fit Residual ---
+        ax5 = fig.add_subplot(gs[2, 1])
+        
+        mean_surprises = np.mean(surprises, axis=1)
+        best_idx = np.argmin(mean_surprises)
+        best_hyp = list(self.hypotheses.values())[best_idx]
+        
+        residual = actual_signal - best_hyp
+        plot_len = min(1000, len(residual))
+        
+        ax5.plot(time[:plot_len], residual[:plot_len], color='#d62728', linewidth=1.5, alpha=0.8)
+        ax5.fill_between(time[:plot_len], residual[:plot_len], alpha=0.2, color='#d62728')
+        ax5.axhline(0, color='black', linestyle='-', linewidth=0.5, alpha=0.3)
+        
+        ax5.set_ylabel('Residual', fontsize=10)
+        ax5.set_xlabel('Time (samples)', fontsize=10)
+        ax5.set_xlim(0, plot_len)
+        ax5.grid(True, alpha=0.2)
+        ax5.set_title(f'Best-Fit Residual (Best: {list(self.hypotheses.keys())[best_idx]})', 
+                     fontweight='bold')
+        
+        plt.savefig('counterfactual_signaling.png', dpi=150, bbox_inches='tight')
+        print("✓ Saved: counterfactual_signaling.png")
+        plt.show()
+
+if __name__ == '__main__':
+    np.random.seed(42)
+    
+    t = np.arange(2000)
+    signal1 = 1.0 * np.sin(2 * np.pi * 2.0 * t[:1000] / 512)
+    signal2 = 0.7 * np.sin(2 * np.pi * 3.5 * t[1000:] / 512)
+    
+    actual = np.concatenate([signal1, signal2])
+    actual += 0.1 * np.random.normal(0, 1, len(actual))
+    
+    cf = CounterfactualSignaling(n_hypotheses=4)
+    cf.generate_hypotheses(len(actual), complexity='moderate')
+    
+    print("Counterfactual Signaling Analysis")
+    print("=" * 50)
+    print(f"Signal length: {len(actual)}")
+    print(f"Number of hypotheses: {len(cf.hypotheses)}")
+    print("=" * 50)
+    
+    cf.plot_counterfactuals(actual)

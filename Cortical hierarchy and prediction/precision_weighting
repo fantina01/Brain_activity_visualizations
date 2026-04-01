@@ -1,0 +1,159 @@
+# File 2: precision_weighting.py
+
+import numpy as np
+import matplotlib.pyplot as plt
+import matplotlib.gridspec as gridspec
+
+plt.rcParams['figure.facecolor'] = 'white'
+plt.rcParams['axes.facecolor'] = 'white'
+plt.rcParams['font.size'] = 10
+
+class PrecisionWeighting:
+    """Estimate precision of prediction errors"""
+    
+    def __init__(self, window_size=150):
+        self.window_size = window_size
+    
+    def estimate_precision(self, pe_signal):
+        """Sliding window precision estimate"""
+        precision = np.zeros_like(pe_signal)
+        variance = np.zeros_like(pe_signal)
+        
+        for t in range(self.window_size, len(pe_signal)):
+            window = pe_signal[t - self.window_size:t]
+            var = np.var(window)
+            precision[t] = 1.0 / (var + 1e-6)
+            variance[t] = var
+        
+        precision[:self.window_size] = precision[self.window_size]
+        variance[:self.window_size] = variance[self.window_size]
+        
+        precision_norm = (precision - np.min(precision)) / (np.max(precision) - np.min(precision) + 1e-8)
+        
+        return precision_norm, variance
+    
+    def weighted_error(self, pe_signal, precision):
+        """Apply precision as multiplicative gate"""
+        return pe_signal * precision
+    
+    def plot_analysis(self, pe_signal):
+        """Comprehensive precision weighting visualization"""
+        fig = plt.figure(figsize=(14, 10))
+        fig.suptitle('Precision Weighting Analysis', fontsize=14, fontweight='bold')
+        
+        gs = gridspec.GridSpec(3, 2, figure=fig, hspace=0.35, wspace=0.3)
+        
+        precision, variance = self.estimate_precision(pe_signal)
+        weighted = self.weighted_error(pe_signal, precision)
+        
+        time = np.arange(len(pe_signal))
+        
+        # --- Panel 1: PE + Precision ---
+        ax1 = fig.add_subplot(gs[0, :])
+        ax1_twin = ax1.twinx()
+        
+        ax1.fill_between(time, pe_signal, alpha=0.3, color='#1f77b4')
+        ax1.plot(time, pe_signal, color='#1f77b4', linewidth=1.5, alpha=0.8, label='Prediction Error')
+        
+        ax1_twin.plot(time, precision, color='#d62728', linewidth=2.5, alpha=0.8, label='Precision')
+        ax1_twin.fill_between(time, precision, alpha=0.2, color='#d62728')
+        
+        ax1.set_ylabel('Prediction Error', fontsize=10, color='#1f77b4', fontweight='bold')
+        ax1_twin.set_ylabel('Precision', fontsize=10, color='#d62728', fontweight='bold')
+        ax1.set_xlim(0, len(time))
+        ax1.grid(True, alpha=0.2)
+        ax1.set_title('Prediction Error & Estimated Precision', fontweight='bold')
+        ax1.tick_params(axis='y', labelcolor='#1f77b4')
+        ax1_twin.tick_params(axis='y', labelcolor='#d62728')
+        
+        # --- Panel 2: Weighted Effect ---
+        ax2 = fig.add_subplot(gs[1, 0])
+        
+        ax2.plot(time, pe_signal, color='gray', linewidth=1, alpha=0.5, label='Unweighted', linestyle='--')
+        ax2.plot(time, weighted, color='#2ca02c', linewidth=2, alpha=0.8, label='Precision-weighted')
+        ax2.fill_between(time, weighted, alpha=0.2, color='#2ca02c')
+        ax2.axhline(0, color='black', linestyle='-', linewidth=0.5, alpha=0.3)
+        
+        ax2.set_ylabel('Error Signal', fontsize=10)
+        ax2.set_xlim(0, len(time))
+        ax2.grid(True, alpha=0.2)
+        ax2.legend(loc='upper right', fontsize=9)
+        ax2.set_title('Effect of Precision Weighting', fontweight='bold')
+        
+        # --- Panel 3: Variance ---
+        ax3 = fig.add_subplot(gs[1, 1])
+        
+        ax3.plot(time, variance, color='#ff7f0e', linewidth=2, alpha=0.8)
+        ax3.fill_between(time, variance, alpha=0.2, color='#ff7f0e')
+        
+        ax3.set_ylabel('Error Variance', fontsize=10)
+        ax3.set_xlim(0, len(time))
+        ax3.grid(True, alpha=0.2)
+        ax3.set_title('Error Reliability Over Time', fontweight='bold')
+        
+        # --- Panel 4: Gains ---
+        ax4 = fig.add_subplot(gs[2, 0])
+        
+        gain_amp = np.mean(np.abs(weighted)) / (np.mean(np.abs(pe_signal)) + 1e-8)
+        noise_weighted = np.std(np.diff(weighted))
+        noise_baseline = np.std(np.diff(pe_signal))
+        gain_snr = (np.mean(np.abs(weighted)) / (noise_weighted + 1e-8)) / \
+                   (np.mean(np.abs(pe_signal)) / (noise_baseline + 1e-8))
+        
+        metrics = ['Amplitude Gain', 'SNR Gain']
+        values = [gain_amp, gain_snr]
+        colors_bar = ['#1f77b4', '#ff7f0e']
+        
+        bars = ax4.bar(metrics, values, color=colors_bar, alpha=0.7, edgecolor='black', linewidth=1.5)
+        ax4.axhline(1.0, color='black', linestyle='--', linewidth=1.5, alpha=0.5, label='Baseline')
+        
+        for bar, val in zip(bars, values):
+            height = bar.get_height()
+            ax4.text(bar.get_x() + bar.get_width()/2., height,
+                    f'{val:.2f}', ha='center', va='bottom', fontsize=10, fontweight='bold')
+        
+        ax4.set_ylabel('Gain Factor', fontsize=10)
+        ax4.set_ylim([0, max(values) * 1.3])
+        ax4.grid(True, alpha=0.2, axis='y')
+        ax4.set_title('Precision Weighting Gains', fontweight='bold')
+        
+        # --- Panel 5: Distribution ---
+        ax5 = fig.add_subplot(gs[2, 1])
+        
+        ax5.hist(precision, bins=40, color='#d62728', alpha=0.7, edgecolor='black')
+        ax5.axvline(np.mean(precision), color='black', linestyle='--', linewidth=2, label='Mean')
+        ax5.axvline(np.median(precision), color='#2ca02c', linestyle='--', linewidth=2, label='Median')
+        
+        ax5.set_xlabel('Precision', fontsize=10)
+        ax5.set_ylabel('Count', fontsize=10)
+        ax5.grid(True, alpha=0.2, axis='y')
+        ax5.legend(fontsize=9)
+        ax5.set_title('Precision Distribution', fontweight='bold')
+        
+        plt.savefig('precision_weighting.png', dpi=150, bbox_inches='tight')
+        print("✓ Saved: precision_weighting.png")
+        plt.show()
+
+if __name__ == '__main__':
+    np.random.seed(42)
+    
+    pe_signal = np.random.normal(0, 0.3, 5000)
+    t = np.arange(len(pe_signal))
+    pe_signal += 0.5 * np.sin(2 * np.pi * 0.01 * t)
+    
+    event_times = np.random.choice(5000, 10, replace=False)
+    for et in event_times:
+        if et + 50 < 5000:
+            pe_signal[et:et+50] += np.linspace(1, -1, 50)
+    
+    pw = PrecisionWeighting(window_size=150)
+    
+    print("Precision Weighting Analysis")
+    print("=" * 50)
+    precision, var = pw.estimate_precision(pe_signal)
+    print(f"Mean precision: {np.mean(precision):.4f}")
+    print(f"Min precision: {np.min(precision):.4f}")
+    print(f"Max precision: {np.max(precision):.4f}")
+    print("=" * 50)
+    
+    pw.plot_analysis(pe_signal)

@@ -1,0 +1,209 @@
+# File 3: attentional_modulation_of_pe.py
+
+import numpy as np
+import matplotlib.pyplot as plt
+import matplotlib.gridspec as gridspec
+
+plt.rcParams['figure.facecolor'] = 'white'
+plt.rcParams['axes.facecolor'] = 'white'
+plt.rcParams['font.size'] = 10
+
+class AttentionModulation:
+    """Attention amplifies prediction errors at attended locations"""
+    
+    def __init__(self, signal_len, n_channels=64):
+        self.signal_len = signal_len
+        self.n_channels = n_channels
+    
+    def generate_spatial_attention(self, focus_pos=None):
+        """Gaussian spatial attention profile"""
+        if focus_pos is None:
+            focus_pos = self.n_channels // 2
+        
+        channels = np.arange(self.n_channels)
+        attention = np.exp(-((channels - focus_pos) ** 2) / (2 * 10**2))
+        attention = attention / np.max(attention)
+        
+        t = np.arange(self.signal_len)
+        temporal_modulation = 0.5 + 0.4 * np.sin(2 * np.pi * 0.02 * t)
+        
+        attention_profile = np.tile(attention, (self.signal_len, 1))
+        attention_profile *= temporal_modulation[:, np.newaxis]
+        
+        return attention_profile
+    
+    def apply_attention(self, pe_signal, attention_profile, strength=1.5):
+        """Apply attention modulation"""
+        if pe_signal.ndim == 1:
+            pe_signal = pe_signal[:, np.newaxis]
+        
+        # Ensure shapes match
+        if len(attention_profile) > len(pe_signal):
+            attention_profile = attention_profile[:len(pe_signal)]
+        elif len(attention_profile) < len(pe_signal):
+            pad = len(pe_signal) - len(attention_profile)
+            attention_profile = np.vstack([attention_profile, attention_profile[-1:]] * (pad // len(attention_profile) + 1))
+            attention_profile = attention_profile[:len(pe_signal)]
+        
+        modulation_gain = 1.0 + strength * (attention_profile - 0.5)
+        modulated = pe_signal * modulation_gain
+        
+        return modulated
+    
+    def compute_modulation_index(self, pe_signal, attention_profile):
+        """Modulation index: (attended - unattended) / (attended + unattended)"""
+        attended_mask = attention_profile > 0.6
+        unattended_mask = attention_profile <= 0.6
+        
+        attended = pe_signal[attended_mask].flatten()
+        unattended = pe_signal[unattended_mask].flatten()
+        
+        if len(attended) == 0 or len(unattended) == 0:
+            return 0.0
+        
+        ami = (np.mean(np.abs(attended)) - np.mean(np.abs(unattended))) / \
+              (np.mean(np.abs(attended)) + np.mean(np.abs(unattended)) + 1e-8)
+        
+        return ami
+    
+    def plot_modulation(self, pe_signal, attention_profile=None):
+        """Visualize attention effects on PE"""
+        if attention_profile is None:
+            attention_profile = self.generate_spatial_attention()
+        
+        pe_modulated = self.apply_attention(pe_signal, attention_profile, strength=1.2)
+        
+        fig = plt.figure(figsize=(14, 10))
+        fig.suptitle('Attention-Dependent Error Modulation', fontsize=14, fontweight='bold')
+        
+        gs = gridspec.GridSpec(3, 2, figure=fig, hspace=0.35, wspace=0.3)
+        
+        time = np.arange(len(pe_signal))
+        
+        # --- Panel 1: Attention Heatmap ---
+        ax1 = fig.add_subplot(gs[0, :])
+        
+        plot_len = min(1000, len(attention_profile))
+        att_plot = attention_profile[:plot_len]
+        
+        im1 = ax1.imshow(att_plot.T, aspect='auto', cmap='hot', origin='lower',
+                        extent=[0, plot_len, 0, self.n_channels])
+        ax1.set_ylabel('Channel', fontsize=10)
+        ax1.set_xlabel('Time (samples)', fontsize=10)
+        ax1.set_title('Spatial Attention Profile Over Time', fontweight='bold')
+        cbar1 = plt.colorbar(im1, ax=ax1)
+        cbar1.set_label('Attention', fontsize=10)
+        
+        # --- Panel 2: Attended vs Unattended ---
+        ax2 = fig.add_subplot(gs[1, 0])
+        
+        attended_mask = attention_profile[:len(pe_signal), 0] > 0.6
+        unattended_mask = ~attended_mask
+        
+        pe_attended = np.zeros_like(pe_signal)
+        pe_unattended = np.zeros_like(pe_signal)
+        
+        pe_attended[attended_mask] = pe_signal[attended_mask]
+        pe_unattended[unattended_mask] = pe_signal[unattended_mask]
+        
+        ax2.plot(time, pe_attended, color='#2ca02c', linewidth=1.5, alpha=0.7, label='Attended PE')
+        ax2.plot(time, pe_unattended, color='#7f7f7f', linewidth=1.5, alpha=0.5, label='Unattended PE')
+        ax2.axhline(0, color='black', linestyle='-', linewidth=0.5, alpha=0.3)
+        
+        ax2.set_ylabel('Error', fontsize=10)
+        ax2.set_xlim(0, len(time))
+        ax2.grid(True, alpha=0.2)
+        ax2.legend(fontsize=9)
+        ax2.set_title('Attention Separates Error Streams', fontweight='bold')
+        
+        # --- Panel 3: Modulation Effect ---
+        ax3 = fig.add_subplot(gs[1, 1])
+        
+        plot_len = min(2000, len(pe_signal), len(pe_modulated))
+        
+        ax3.plot(time[:plot_len], pe_signal[:plot_len], color='gray', linewidth=1, alpha=0.5, 
+                linestyle='--', label='Baseline')
+        ax3.plot(time[:plot_len], pe_modulated[:plot_len, 0], color='#1f77b4', linewidth=1.5, 
+                alpha=0.8, label='Attention-modulated')
+        ax3.fill_between(time[:plot_len], pe_modulated[:plot_len, 0], alpha=0.2, color='#1f77b4')
+        ax3.axhline(0, color='black', linestyle='-', linewidth=0.5, alpha=0.3)
+        
+        ax3.set_ylabel('Error Signal', fontsize=10)
+        ax3.set_xlim(0, plot_len)
+        ax3.grid(True, alpha=0.2)
+        ax3.legend(fontsize=9)
+        ax3.set_title('Modulation Effect', fontweight='bold')
+        
+        # --- Panel 4: Gain Metrics ---
+        ax4 = fig.add_subplot(gs[2, 0])
+        
+        baseline_amp = np.mean(np.abs(pe_signal))
+        modulated_amp = np.mean(np.abs(pe_modulated))
+        gain_amp = modulated_amp / (baseline_amp + 1e-8)
+        
+        baseline_snr = np.mean(np.abs(pe_signal)) / (np.std(np.diff(pe_signal)) + 1e-8)
+        modulated_snr = np.mean(np.abs(pe_modulated)) / (np.std(np.diff(pe_modulated)) + 1e-8)
+        gain_snr = modulated_snr / (baseline_snr + 1e-8)
+        
+        metrics = ['Amplitude\nGain', 'SNR\nGain']
+        values = [gain_amp, gain_snr]
+        colors_bar = ['#1f77b4', '#ff7f0e']
+        
+        bars = ax4.bar(metrics, values, color=colors_bar, alpha=0.7, edgecolor='black', linewidth=1.5)
+        ax4.axhline(1.0, color='black', linestyle='--', linewidth=1.5, alpha=0.5)
+        
+        for bar, val in zip(bars, values):
+            height = bar.get_height()
+            ax4.text(bar.get_x() + bar.get_width()/2., height,
+                    f'{val:.2f}x', ha='center', va='bottom', fontsize=10, fontweight='bold')
+        
+        ax4.set_ylabel('Gain Factor', fontsize=10)
+        ax4.set_ylim([0, max(values) * 1.4])
+        ax4.grid(True, alpha=0.2, axis='y')
+        ax4.set_title('Attention-Related Gain', fontweight='bold')
+        
+        # --- Panel 5: Modulation Index ---
+        ax5 = fig.add_subplot(gs[2, 1])
+        
+        window_size = 500
+        ami_vals = []
+        ami_times = []
+        
+        for t in range(window_size, len(pe_signal), 100):
+            window_data = pe_signal[t-window_size:t]
+            window_att = attention_profile[t-window_size:t]
+            ami = self.compute_modulation_index(window_data, window_att)
+            ami_vals.append(ami)
+            ami_times.append(t)
+        
+        ax5.plot(ami_times, ami_vals, color='#d62728', linewidth=2.5, marker='o', markersize=5)
+        ax5.fill_between(ami_times, ami_vals, alpha=0.2, color='#d62728')
+        ax5.axhline(0, color='black', linestyle='--', linewidth=1, alpha=0.5)
+        
+        ax5.set_xlabel('Time (samples)', fontsize=10)
+        ax5.set_ylabel('Modulation Index', fontsize=10)
+        ax5.grid(True, alpha=0.2)
+        ax5.set_title('Attention Modulation Index Over Time', fontweight='bold')
+        
+        plt.savefig('attention_modulation.png', dpi=150, bbox_inches='tight')
+        print("✓ Saved: attention_modulation.png")
+        plt.show()
+
+if __name__ == '__main__':
+    np.random.seed(42)
+    
+    pe_signal = np.random.normal(0, 0.5, 5000)
+    t = np.arange(len(pe_signal))
+    pe_signal += 0.3 * np.sin(2 * np.pi * 0.01 * t)
+    
+    am = AttentionModulation(len(pe_signal), n_channels=64)
+    attention = am.generate_spatial_attention(focus_pos=32)
+    
+    print("Attention-Dependent Error Modulation")
+    print("=" * 50)
+    print(f"Signal length: {len(pe_signal)}")
+    print(f"Channels: {am.n_channels}")
+    print(f"Mean attention: {np.mean(attention):.3f}")
+    print("=" * 50)
+    
+    am.plot_modulation(pe_signal, attention)

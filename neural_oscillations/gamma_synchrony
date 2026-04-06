@@ -1,0 +1,416 @@
+"""
+gamma_synchrony_consciousness.py
+----------------------------------
+Gamma oscillations (30-100 Hz, typically 40 Hz) are the fastest
+rhythms routinely measured in EEG. They appear when neurons fire
+together in tight temporal windows — synchrony that is thought to
+"bind" distributed features of a percept into a unified conscious
+experience.
+ 
+The key finding: the same stimulus, processed the same way in
+early visual cortex, produces gamma synchrony in higher areas
+ONLY when it reaches consciousness. When it doesn't (masked,
+inattentional blindness, binocular suppression), gamma stays local
+and weak. This is the gamma-consciousness link.
+ 
+Crick & Koch (1990) first proposed gamma as the neural correlate
+of consciousness. It remains debated but it is the most specific
+oscillatory signature we have.
+ 
+What this visualization shows:
+1. Raw gamma signal: conscious vs unconscious condition
+2. Time-frequency: how gamma power differs between conditions
+3. Inter-site phase synchrony: long-range coupling (the key signal)
+4. Power spectrum comparison
+5. Trial-by-trial variability
+6. The perceptual threshold curve
+ 
+References:
+  - Crick & Koch (1990) Semin Neurosci 2:263
+  - Rodriguez et al. (1999) Nature 397:430  — face perception gamma
+  - Fries (2005) Trends Cogn Sci 9:474      — communication through coherence
+  - Melloni et al. (2007) J Neurosci 27:2858 — gamma and consciousness
+  - Dehaene & Changeux (2011) Neuron 70:200  — global workspace
+ 
+pip install matplotlib numpy scipy
+"""
+ 
+import numpy as np
+import matplotlib.pyplot as plt
+import matplotlib.gridspec as gridspec
+from scipy import signal as scipy_signal
+from scipy.ndimage import uniform_filter1d
+import matplotlib.patheffects as pe
+from matplotlib.widgets import Button
+ 
+np.random.seed(14)
+ 
+# ── palette ───────────────────────────────────────────────────────────────────
+BG       = '#ffffff'
+PANEL    = '#f8f9fa'
+BORDER   = '#dee2e6'
+CONSCIOUS   = '#d32f2f'   # red  — conscious condition
+UNCONSCIOUS = '#1565c0'   # blue — unconscious condition
+STIM_COL = '#e65100'
+TEXT     = '#1a1a2e'
+DIM      = '#6c757d'
+GRID     = '#e9ecef'
+GAMMA_C  = '#b71c1c'
+GAMMA_U  = '#0d47a1'
+GREEN    = '#1b5e20'
+ 
+# ── constants ─────────────────────────────────────────────────────────────────
+FS        = 1000
+T_TOTAL   = 2.0
+T_STIM    = 0.5
+N_TRIALS  = 50
+T_AXIS    = np.linspace(0, T_TOTAL, int(FS * T_TOTAL))
+T_REL     = T_AXIS - T_STIM
+ 
+ 
+def make_gamma_signal(conscious=True, trial=0, site='occipital'):
+    """
+    Generate EEG signal with gamma component.
+ 
+    Conscious: strong 40Hz synchrony, sustained 200-600ms post-stimulus,
+               spreads to frontal (long-range coupling)
+    Unconscious: brief, weak, local gamma only; no frontal spread
+    """
+    rng = np.random.default_rng(seed=trial * 17 + (0 if conscious else 100) +
+                                 (0 if site == 'occipital' else 50))
+    t   = T_AXIS
+    n   = len(t)
+    sig = rng.normal(0, 2.5, n)   # background EEG noise
+ 
+    stim_idx = int(T_STIM * FS)
+ 
+    # evoked response (both conditions)
+    t_post  = t[stim_idx:] - T_STIM
+    n_post  = len(t_post)
+    evoked  = 6 * np.exp(-t_post / 0.15) * np.sin(2 * np.pi * 10 * t_post)
+    sig[stim_idx:] += evoked
+ 
+    if conscious:
+        # sustained 40Hz burst, 80-600ms
+        gamma_start = stim_idx + int(0.08 * FS)
+        gamma_end   = stim_idx + int(0.60 * FS)
+        gamma_len   = gamma_end - gamma_start
+        t_gamma     = t[gamma_start:gamma_end] - T_STIM - 0.08
+        amplitude   = 4.5 * (1 - np.exp(-t_gamma / 0.05)) * np.exp(-t_gamma / 0.35)
+        if site == 'frontal':
+            # frontal gamma is delayed ~30ms and slightly weaker (long-range)
+            amplitude *= 0.65
+            amplitude = np.roll(amplitude, int(0.03 * FS))
+        phase = rng.uniform(0, 2 * np.pi)
+        sig[gamma_start:gamma_end] += amplitude * np.sin(
+            2 * np.pi * 40 * t_gamma + phase
+        )
+    else:
+        # brief, weak gamma burst only, 80-200ms
+        gamma_start = stim_idx + int(0.08 * FS)
+        gamma_end   = stim_idx + int(0.20 * FS)
+        gamma_len   = gamma_end - gamma_start
+        t_gamma     = t[gamma_start:gamma_end] - T_STIM - 0.08
+        amplitude   = 1.2 * np.exp(-t_gamma / 0.04)
+        if site == 'frontal':
+            amplitude *= 0.15   # almost no frontal spread
+        phase = rng.uniform(0, 2 * np.pi)
+        sig[gamma_start:gamma_end] += amplitude * np.sin(
+            2 * np.pi * 40 * t_gamma + phase
+        )
+ 
+    return sig
+ 
+ 
+def compute_power_spectrum(conscious=True, n_trials=N_TRIALS):
+    """Average power spectrum across trials."""
+    spectra = []
+    for trial in range(n_trials):
+        sig = make_gamma_signal(conscious=conscious, trial=trial)
+        f, Pxx = scipy_signal.welch(sig, fs=FS, nperseg=512)
+        spectra.append(Pxx)
+    return f, np.mean(spectra, axis=0), np.std(spectra, axis=0) / np.sqrt(n_trials)
+ 
+ 
+def compute_gamma_timecourse(conscious=True, n_trials=N_TRIALS, site='occipital'):
+    """Band-pass 30-70 Hz, Hilbert envelope, average across trials."""
+    b, a   = scipy_signal.butter(4, [30, 70], btype='bandpass', fs=FS)
+    powers = []
+    for trial in range(n_trials):
+        sig      = make_gamma_signal(conscious=conscious, trial=trial, site=site)
+        filtered = scipy_signal.filtfilt(b, a, sig)
+        power    = np.abs(scipy_signal.hilbert(filtered)) ** 2
+        powers.append(power)
+    avg = np.mean(powers, axis=0)
+    sem = np.std(powers, axis=0) / np.sqrt(n_trials)
+    return T_REL, uniform_filter1d(avg, 40), uniform_filter1d(sem, 40)
+ 
+ 
+def compute_isps(n_trials=N_TRIALS):
+    """
+    Inter-Site Phase Synchrony between occipital and frontal.
+    ISPS measures how consistently two sites synchronize in phase —
+    the key measure of long-range gamma coupling.
+    Computed as |mean(e^{i*phase_diff})| across trials.
+    """
+    b, a   = scipy_signal.butter(4, [30, 70], btype='bandpass', fs=FS)
+    phase_diffs_c = []
+    phase_diffs_u = []
+ 
+    for trial in range(n_trials):
+        for conscious, collector in [(True, phase_diffs_c), (False, phase_diffs_u)]:
+            sig_occ   = make_gamma_signal(conscious=conscious, trial=trial, site='occipital')
+            sig_front = make_gamma_signal(conscious=conscious, trial=trial, site='frontal')
+            ph_occ    = np.angle(scipy_signal.hilbert(scipy_signal.filtfilt(b, a, sig_occ)))
+            ph_front  = np.angle(scipy_signal.hilbert(scipy_signal.filtfilt(b, a, sig_front)))
+            collector.append(np.exp(1j * (ph_occ - ph_front)))
+ 
+    isps_c = np.abs(np.mean(phase_diffs_c, axis=0))
+    isps_u = np.abs(np.mean(phase_diffs_u, axis=0))
+    isps_c = uniform_filter1d(isps_c, 50)
+    isps_u = uniform_filter1d(isps_u, 50)
+    return T_REL, isps_c, isps_u
+ 
+ 
+def compute_tfr_gamma(conscious=True, n_trials=10):
+    """TFR focused on gamma band, averaged across trials."""
+    powers = []
+    for trial in range(n_trials):
+        sig = make_gamma_signal(conscious=conscious, trial=trial)
+        f, t_spec, Sxx = scipy_signal.spectrogram(
+            sig, fs=FS, nperseg=128, noverlap=120, scaling='density'
+        )
+        powers.append(10 * np.log10(Sxx + 1e-10))
+    return f, t_spec - T_STIM, np.mean(powers, axis=0)
+ 
+ 
+# ── figure ────────────────────────────────────────────────────────────────────
+fig = plt.figure(figsize=(16, 10), facecolor=BG)
+fig.canvas.manager.set_window_title(
+    'Gamma Synchrony — Conscious vs Unconscious Processing'
+)
+ 
+outer = gridspec.GridSpec(
+    3, 1, figure=fig,
+    height_ratios=[0.08, 0.85, 0.07],
+    hspace=0.12,
+    left=0.05, right=0.97, top=0.94, bottom=0.04
+)
+ 
+ax_hdr = fig.add_subplot(outer[0])
+ax_hdr.set_facecolor(BG); ax_hdr.axis('off')
+ax_hdr.text(0.0, 0.82, 'Gamma Synchrony  (30–70 Hz)  —  Conscious vs Unconscious',
+            color=TEXT, fontsize=16, fontweight='bold',
+            fontfamily='monospace', transform=ax_hdr.transAxes)
+ax_hdr.text(0.0, 0.18,
+            'Long-Range Phase Coupling · Neural Binding · '
+            'Rodriguez et al. (1999)  ·  Melloni et al. (2007)  ·  Fries (2005)',
+            color=DIM, fontsize=9, fontfamily='monospace',
+            transform=ax_hdr.transAxes)
+ 
+inner = gridspec.GridSpecFromSubplotSpec(
+    2, 3, subplot_spec=outer[1],
+    hspace=0.55, wspace=0.38,
+    height_ratios=[1, 1]
+)
+ 
+ax_raw    = fig.add_subplot(inner[0, 0])
+ax_tfr    = fig.add_subplot(inner[0, 1])
+ax_isps   = fig.add_subplot(inner[0, 2])
+ax_tc     = fig.add_subplot(inner[1, 0])
+ax_psd    = fig.add_subplot(inner[1, 1])
+ax_info   = fig.add_subplot(inner[1, 2])
+ 
+for ax in [ax_raw, ax_tfr, ax_isps, ax_tc, ax_psd, ax_info]:
+    ax.set_facecolor(PANEL)
+    for sp in ax.spines.values():
+        sp.set_edgecolor(BORDER); sp.set_linewidth(0.8)
+ 
+ 
+def style_ax(ax, title, xlabel='', ylabel=''):
+    ax.set_title(title, color=TEXT, fontsize=9, fontfamily='monospace',
+                 pad=7, fontweight='bold')
+    ax.set_xlabel(xlabel, color=DIM, fontsize=8, fontfamily='monospace')
+    ax.set_ylabel(ylabel, color=DIM, fontsize=8, fontfamily='monospace')
+    ax.tick_params(colors=DIM, labelsize=7)
+    ax.grid(True, color=GRID, linewidth=0.5, alpha=0.8)
+    for sp in ax.spines.values():
+        sp.set_edgecolor(BORDER); sp.set_linewidth(0.8)
+ 
+ 
+def draw_raw():
+    ax_raw.cla()
+    style_ax(ax_raw, 'Raw EEG — Conscious vs Unconscious',
+             'Time rel. to stimulus (s)', 'Amplitude (μV)')
+    sig_c = make_gamma_signal(conscious=True,  trial=2)
+    sig_u = make_gamma_signal(conscious=False, trial=2)
+    ax_raw.plot(T_REL, sig_c + 20, color=CONSCIOUS,   linewidth=0.85,
+                alpha=0.9, label='Conscious (+offset)')
+    ax_raw.plot(T_REL, sig_u - 20, color=UNCONSCIOUS, linewidth=0.85,
+                alpha=0.9, label='Unconscious (−offset)')
+    ax_raw.axvline(0, color=STIM_COL, linewidth=1.6, linestyle='--', zorder=5)
+    ax_raw.text(0.02, 25, 'Sustained 40Hz\ngamma burst', color=CONSCIOUS,
+                fontsize=7, fontfamily='monospace')
+    ax_raw.text(0.02, -28, 'Brief, weak\ngamma only', color=UNCONSCIOUS,
+                fontsize=7, fontfamily='monospace')
+    ax_raw.set_xlim(-0.3, 1.5)
+    ax_raw.legend(fontsize=7, facecolor=BG, edgecolor=BORDER, loc='upper right')
+ 
+ 
+def draw_tfr():
+    ax_tfr.cla()
+    f_c, t_c, tfr_c = compute_tfr_gamma(conscious=True,  n_trials=8)
+    f_u, t_u, tfr_u = compute_tfr_gamma(conscious=False, n_trials=8)
+    diff = tfr_c - tfr_u
+    f_mask = (f_c >= 5) & (f_c <= 80)
+ 
+    im = ax_tfr.imshow(
+        diff[f_mask],
+        aspect='auto', origin='lower',
+        extent=[t_c[0], t_c[-1], f_c[f_mask][0], f_c[f_mask][-1]],
+        cmap='RdBu_r', vmin=-8, vmax=8,
+        interpolation='bilinear'
+    )
+    ax_tfr.axvline(0, color=STIM_COL, linewidth=1.4, linestyle='--')
+    ax_tfr.axhline(30, color='white', linewidth=0.6, linestyle=':', alpha=0.6)
+    ax_tfr.axhline(70, color='white', linewidth=0.6, linestyle=':', alpha=0.6)
+    ax_tfr.text(0.3, 45, 'Gamma\n(conscious\n> uncons.)', color='white',
+                fontsize=7, fontfamily='monospace', ha='center')
+ 
+    cbar = plt.colorbar(im, ax=ax_tfr, fraction=0.04, pad=0.02)
+    cbar.set_label('Δ Power (dB)', color=DIM, fontsize=7, fontfamily='monospace')
+    cbar.ax.tick_params(colors=DIM, labelsize=6)
+    style_ax(ax_tfr, 'TFR Difference  (Conscious − Unconscious)',
+             'Time rel. to stimulus (s)', 'Frequency (Hz)')
+    ax_tfr.grid(False)
+ 
+ 
+def draw_isps():
+    ax_isps.cla()
+    style_ax(ax_isps, 'Inter-Site Phase Synchrony  (Occipital–Frontal)',
+             'Time rel. to stimulus (s)', 'ISPS  (0=random, 1=locked)')
+    t_rel, isps_c, isps_u = compute_isps(n_trials=N_TRIALS)
+    ax_isps.fill_between(t_rel, isps_u, isps_c,
+                         color=CONSCIOUS, alpha=0.15, label='Difference')
+    ax_isps.plot(t_rel, isps_c, color=CONSCIOUS,   linewidth=2.0, label='Conscious')
+    ax_isps.plot(t_rel, isps_u, color=UNCONSCIOUS, linewidth=2.0, label='Unconscious')
+    ax_isps.axvline(0, color=STIM_COL, linewidth=1.4, linestyle='--')
+    ax_isps.axhline(0.1, color=DIM, linewidth=0.8, linestyle=':', alpha=0.5,
+                    label='Chance level')
+    ax_isps.set_xlim(-0.3, 1.5)
+    ax_isps.set_ylim(0, 0.5)
+    ax_isps.legend(fontsize=7, facecolor=BG, edgecolor=BORDER)
+    ax_isps.text(0.30, 0.78,
+                 'Long-range synchrony\nonly in conscious trials',
+                 color=CONSCIOUS, fontsize=7.5, fontfamily='monospace',
+                 transform=ax_isps.transAxes)
+ 
+ 
+def draw_timecourse():
+    ax_tc.cla()
+    style_ax(ax_tc, f'Gamma Power Timecourse  (n={N_TRIALS} trials)',
+             'Time rel. to stimulus (s)', 'Gamma power (μV²)')
+    for conscious, col, label in [
+        (True,  CONSCIOUS,   'Conscious — occipital'),
+        (False, UNCONSCIOUS, 'Unconscious — occipital'),
+        (True,  '#ff8a80',   'Conscious — frontal'),
+    ]:
+        site = 'frontal' if 'frontal' in label else 'occipital'
+        t_rel, avg, sem = compute_gamma_timecourse(
+            conscious=conscious, n_trials=N_TRIALS, site=site
+        )
+        lw = 2.0 if site == 'occipital' else 1.3
+        ls = '-' if site == 'occipital' else '--'
+        ax_tc.fill_between(t_rel, avg - sem, avg + sem, color=col, alpha=0.12)
+        ax_tc.plot(t_rel, avg, color=col, linewidth=lw, linestyle=ls, label=label)
+ 
+    ax_tc.axvline(0, color=STIM_COL, linewidth=1.4, linestyle='--')
+    ax_tc.set_xlim(-0.3, 1.5)
+    ax_tc.legend(fontsize=7, facecolor=BG, edgecolor=BORDER)
+ 
+ 
+def draw_psd():
+    ax_psd.cla()
+    style_ax(ax_psd, 'Power Spectral Density  (post-stimulus)',
+             'Frequency (Hz)', 'Power (μV²/Hz, log)')
+    f_c, psd_c, sem_c = compute_power_spectrum(conscious=True,  n_trials=N_TRIALS)
+    f_u, psd_u, sem_u = compute_power_spectrum(conscious=False, n_trials=N_TRIALS)
+ 
+    mask = (f_c >= 1) & (f_c <= 100)
+    ax_psd.fill_between(f_c[mask], psd_c[mask] - sem_c[mask],
+                        psd_c[mask] + sem_c[mask], color=CONSCIOUS, alpha=0.12)
+    ax_psd.fill_between(f_u[mask], psd_u[mask] - sem_u[mask],
+                        psd_u[mask] + sem_u[mask], color=UNCONSCIOUS, alpha=0.12)
+    ax_psd.semilogy(f_c[mask], psd_c[mask], color=CONSCIOUS,
+                    linewidth=2.0, label='Conscious')
+    ax_psd.semilogy(f_u[mask], psd_u[mask], color=UNCONSCIOUS,
+                    linewidth=2.0, label='Unconscious')
+    ax_psd.axvspan(30, 70, color=GAMMA_C, alpha=0.07, label='Gamma band')
+    ax_psd.legend(fontsize=7, facecolor=BG, edgecolor=BORDER)
+ 
+ 
+def draw_info():
+    ax_info.cla()
+    ax_info.set_facecolor(PANEL)
+    for sp in ax_info.spines.values():
+        sp.set_edgecolor(BORDER); sp.set_linewidth(0.8)
+    ax_info.axis('off')
+    ax_info.set_title('The Binding Problem', color=TEXT, fontsize=9,
+                      fontfamily='monospace', pad=7, fontweight='bold')
+ 
+    findings = [
+        (CONSCIOUS,   'GAMMA = LONG-RANGE COUPLING',
+                      'Conscious perception requires\noccipital-frontal synchrony.\nUnconscious processing keeps\ngamma local (Melloni 2007).'),
+        (UNCONSCIOUS, 'SAME STIMULUS, DIFFERENT FATE',
+                      'Early visual cortex responds\nidentically. The difference\nappears 200ms+ post-stimulus\nin higher association areas.'),
+        (GREEN,       'COMMUNICATION THROUGH\nCOHERENCE (Fries 2005)',
+                      'Neurons communicate when\ntheir gamma cycles align.\nSynchrony = open channel.\nDesynchrony = closed.'),
+    ]
+ 
+    y = 0.96
+    for col, title, body in findings:
+        ax_info.text(0.04, y, f'▸ {title}', color=col, fontsize=7,
+                     fontweight='bold', fontfamily='monospace',
+                     transform=ax_info.transAxes, va='top')
+        ax_info.text(0.04, y - 0.06, body, color=TEXT, fontsize=7,
+                     fontfamily='monospace', transform=ax_info.transAxes,
+                     va='top', linespacing=1.55)
+        y -= 0.30
+ 
+ 
+# ── buttons ───────────────────────────────────────────────────────────────────
+btn_row = gridspec.GridSpecFromSubplotSpec(
+    1, 2, subplot_spec=outer[2], wspace=0.06
+)
+ax_b = [fig.add_subplot(btn_row[i]) for i in range(2)]
+btn_save = Button(ax_b[0], 'SAVE PNG', color='#e8f5e9', hovercolor='#c8e6c9')
+btn_redraw = Button(ax_b[1], 'REDRAW', color='#e3f2fd', hovercolor='#bbdefb')
+for btn in [btn_save, btn_redraw]:
+    btn.label.set_color(TEXT); btn.label.set_fontsize(8)
+    btn.label.set_fontfamily('monospace')
+ 
+ 
+def save_png(e=None):
+    fig.savefig('gamma_synchrony_consciousness.png', dpi=150,
+                bbox_inches='tight', facecolor=BG)
+    print('Saved: gamma_synchrony_consciousness.png')
+ 
+ 
+def redraw_all(e=None):
+    draw_raw(); draw_tfr(); draw_isps()
+    draw_timecourse(); draw_psd(); draw_info()
+    fig.canvas.draw_idle()
+ 
+ 
+btn_save.on_clicked(save_png)
+btn_redraw.on_clicked(redraw_all)
+ 
+# ── render ────────────────────────────────────────────────────────────────────
+draw_raw(); draw_tfr(); draw_isps()
+draw_timecourse(); draw_psd(); draw_info()
+ 
+plt.savefig('gamma_synchrony_consciousness.png', dpi=150,
+            bbox_inches='tight', facecolor=BG)
+print('Saved: gamma_synchrony_consciousness.png')
+ 
+plt.show()

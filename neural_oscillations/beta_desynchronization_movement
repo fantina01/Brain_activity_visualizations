@@ -1,0 +1,416 @@
+
+
+"""
+beta_desynchronization_movement.py
+------------------------------------
+Beta oscillations (13-30 Hz) over motor cortex are the brain's
+"status quo" signal. When nothing is changing and no movement
+is planned, beta is high — it maintains the current motor state.
+ 
+The moment you plan or initiate a movement, beta drops sharply.
+This is event-related desynchronization (ERD), and it happens
+200-500ms BEFORE the movement itself — meaning beta suppression
+is preparatory, not reactive.
+ 
+After the movement ends, beta rebounds above baseline (ERS —
+event-related synchronization). This rebound is called the
+post-movement beta rebound (PMBR) and is thought to actively
+suppress further movement and "reset" the motor system.
+ 
+The beta-movement relationship is one of the most studied
+phenomena in motor neuroscience and has direct clinical relevance
+in Parkinson's disease, where pathologically elevated beta in
+basal ganglia correlates with motor freezing and rigidity.
+ 
+References:
+  - Pfurtscheller et al. (1996) Electroencephalogr Clin Neurophysiol
+  - Kilavik et al. (2013) Neuroscience 250:287
+  - Little & Brown (2014) Exp Neurol 245:34  — Parkinson's beta
+  - Engel & Fries (2010) Curr Opin Neurobiol 20:156
+  - Jenkinson & Brown (2011) Trends Neurosci 34:611
+ 
+pip install matplotlib numpy scipy
+"""
+ 
+import numpy as np
+import matplotlib.pyplot as plt
+import matplotlib.gridspec as gridspec
+from scipy import signal as scipy_signal
+from scipy.ndimage import uniform_filter1d
+from matplotlib.widgets import Button
+import matplotlib.patheffects as pe
+ 
+np.random.seed(8)
+ 
+# ── palette ───────────────────────────────────────────────────────────────────
+BG       = '#ffffff'
+PANEL    = '#f8f9fa'
+BORDER   = '#dee2e6'
+BETA     = '#1a237e'     # dark blue — beta
+ERD      = '#b71c1c'     # red  — desynchronization
+ERS      = '#1b5e20'     # green — rebound
+MOVEMENT = '#e65100'     # orange — movement onset
+PD_COL   = '#6a1b9a'     # purple — Parkinson's
+HEALTHY  = '#0277bd'     # blue   — healthy
+TEXT     = '#1a1a2e'
+DIM      = '#6c757d'
+GRID     = '#e9ecef'
+ 
+# ── constants ─────────────────────────────────────────────────────────────────
+FS         = 1000
+T_TOTAL    = 4.0     # seconds
+T_MOVEMENT = 1.5     # movement onset
+T_END      = 2.2     # movement end
+N_TRIALS   = 40
+T_AXIS     = np.linspace(0, T_TOTAL, int(FS * T_TOTAL))
+T_REL      = T_AXIS - T_MOVEMENT
+ 
+ 
+def make_beta_signal(condition='healthy', trial=0):
+    """
+    Generate motor cortex EEG signal.
+ 
+    healthy: clear ERD before movement, PMBR after
+    parkinsons: elevated baseline beta, impaired ERD
+    """
+    rng   = np.random.default_rng(seed=trial * 19 + (0 if condition == 'healthy' else 200))
+    t     = T_AXIS
+    n     = len(t)
+    sig   = np.zeros(n)
+    f_beta = 20 + rng.uniform(-2, 2)
+ 
+    move_idx = int(T_MOVEMENT * FS)
+    end_idx  = int(T_END * FS)
+ 
+    if condition == 'healthy':
+        baseline_amp = 5.0 + rng.uniform(-0.5, 0.5)
+        erd_depth    = 0.72 + rng.uniform(-0.08, 0.08)
+        pmbr_amp     = 1.35 + rng.uniform(-0.10, 0.10)
+    else:  # Parkinson's
+        baseline_amp = 9.0 + rng.uniform(-0.8, 0.8)   # elevated
+        erd_depth    = 0.30 + rng.uniform(-0.06, 0.06) # impaired suppression
+        pmbr_amp     = 1.15 + rng.uniform(-0.08, 0.08)
+ 
+    # pre-movement baseline beta
+    sig[:move_idx] = baseline_amp * np.sin(
+        2 * np.pi * f_beta * t[:move_idx] + rng.uniform(0, 2 * np.pi)
+    )
+ 
+    # ERD: gradual suppression starting 500ms before movement
+    erd_start = max(0, move_idx - int(0.5 * FS))
+    erd_len   = move_idx - erd_start + (end_idx - move_idx)
+    t_erd     = t[erd_start:end_idx] - t[erd_start]
+    fade_in   = np.clip(t_erd / 0.5, 0, 1)
+    erd_env   = baseline_amp * (1 - erd_depth * fade_in)
+    sig[erd_start:end_idx] = erd_env * np.sin(
+        2 * np.pi * f_beta * t[erd_start:end_idx] + rng.uniform(0, 2 * np.pi)
+    )
+ 
+    # PMBR: rebound above baseline, 200-800ms after movement end
+    pmbr_start = end_idx + int(0.15 * FS)
+    pmbr_end   = min(n, end_idx + int(0.90 * FS))
+    t_pmbr     = t[pmbr_start:pmbr_end] - t[pmbr_start]
+    pmbr_env   = (baseline_amp * pmbr_amp *
+                  np.exp(-t_pmbr / 0.4) * (1 - np.exp(-t_pmbr / 0.05)))
+    sig[pmbr_start:pmbr_end] = pmbr_env * np.sin(
+        2 * np.pi * f_beta * t[pmbr_start:pmbr_end] + rng.uniform(0, 2 * np.pi)
+    )
+ 
+    # return to baseline
+    if pmbr_end < n:
+        decay_len = n - pmbr_end
+        t_decay   = t[pmbr_end:] - t[pmbr_end]
+        env_return = baseline_amp * (1 - np.exp(-t_decay / 0.3))
+        sig[pmbr_end:] = env_return * np.sin(
+            2 * np.pi * f_beta * t[pmbr_end:] + rng.uniform(0, 2 * np.pi)
+        )
+ 
+    sig += rng.normal(0, 1.0, n)
+    return sig
+ 
+ 
+def compute_beta_timecourse(condition='healthy', n_trials=N_TRIALS):
+    """Beta band power timecourse across trials."""
+    b, a   = scipy_signal.butter(4, [13, 30], btype='bandpass', fs=FS)
+    powers = []
+    for trial in range(n_trials):
+        sig     = make_beta_signal(condition=condition, trial=trial)
+        filt    = scipy_signal.filtfilt(b, a, sig)
+        power   = np.abs(scipy_signal.hilbert(filt)) ** 2
+        powers.append(power)
+    avg = np.mean(powers, axis=0)
+    sem = np.std(powers, axis=0) / np.sqrt(n_trials)
+    return T_REL, uniform_filter1d(avg, 40), uniform_filter1d(sem, 40)
+ 
+ 
+def compute_tfr(condition='healthy', n_trials=8):
+    """TFR across trials."""
+    powers = []
+    for trial in range(n_trials):
+        sig = make_beta_signal(condition=condition, trial=trial)
+        f, t_spec, Sxx = scipy_signal.spectrogram(
+            sig, fs=FS, nperseg=256, noverlap=248, scaling='density'
+        )
+        powers.append(10 * np.log10(Sxx + 1e-10))
+    avg    = np.mean(powers, axis=0)
+    t_rel  = t_spec - T_MOVEMENT
+    b_mask = (f >= 2) & (f <= 50)
+    base   = avg[b_mask, t_spec < T_MOVEMENT - 0.2].mean(axis=1, keepdims=True)
+    ersp   = avg[b_mask] - base
+    return f[b_mask], t_rel, ersp
+ 
+ 
+def compute_topography(phase='erd'):
+    """Simulated 2D scalp topography of beta power."""
+    grid = np.zeros((8, 8))
+    rng  = np.random.default_rng(seed=99)
+    for i in range(8):
+        for j in range(8):
+            dist_motor = np.sqrt((i - 3.0)**2 + (j - 3.5)**2)
+            if phase == 'baseline':
+                grid[i, j] = np.exp(-dist_motor / 2.0) * 7 + rng.uniform(0, 0.5)
+            elif phase == 'erd':
+                grid[i, j] = np.exp(-dist_motor / 2.0) * 1.5 + rng.uniform(0, 0.3)
+            else:  # pmbr
+                grid[i, j] = np.exp(-dist_motor / 1.8) * 9 + rng.uniform(0, 0.4)
+    return grid
+ 
+ 
+# ── figure ────────────────────────────────────────────────────────────────────
+fig = plt.figure(figsize=(16, 10), facecolor=BG)
+fig.canvas.manager.set_window_title(
+    'Beta Desynchronization — Movement Preparation & Execution'
+)
+ 
+outer = gridspec.GridSpec(
+    3, 1, figure=fig,
+    height_ratios=[0.08, 0.85, 0.07],
+    hspace=0.12,
+    left=0.05, right=0.97, top=0.94, bottom=0.04
+)
+ 
+ax_hdr = fig.add_subplot(outer[0])
+ax_hdr.set_facecolor(BG); ax_hdr.axis('off')
+ax_hdr.text(0.0, 0.82, 'Beta Desynchronization  (13–30 Hz)  —  Movement & Motor Control',
+            color=TEXT, fontsize=15, fontweight='bold',
+            fontfamily='monospace', transform=ax_hdr.transAxes)
+ax_hdr.text(0.0, 0.18,
+            'ERD · Post-Movement Beta Rebound · Parkinson\'s Pathology  ·  '
+            'Pfurtscheller (1996)  ·  Kilavik et al. (2013)  ·  Engel & Fries (2010)',
+            color=DIM, fontsize=9, fontfamily='monospace',
+            transform=ax_hdr.transAxes)
+ 
+inner = gridspec.GridSpecFromSubplotSpec(
+    2, 3, subplot_spec=outer[1],
+    hspace=0.55, wspace=0.38,
+    height_ratios=[1, 1]
+)
+ 
+ax_raw  = fig.add_subplot(inner[0, 0])
+ax_tfr  = fig.add_subplot(inner[0, 1])
+ax_topo = fig.add_subplot(inner[0, 2])
+ax_tc   = fig.add_subplot(inner[1, 0])
+ax_pd   = fig.add_subplot(inner[1, 1])
+ax_info = fig.add_subplot(inner[1, 2])
+ 
+for ax in [ax_raw, ax_tfr, ax_topo, ax_tc, ax_pd, ax_info]:
+    ax.set_facecolor(PANEL)
+    for sp in ax.spines.values():
+        sp.set_edgecolor(BORDER); sp.set_linewidth(0.8)
+ 
+ 
+def style_ax(ax, title, xlabel='', ylabel=''):
+    ax.set_title(title, color=TEXT, fontsize=9, fontfamily='monospace',
+                 pad=7, fontweight='bold')
+    ax.set_xlabel(xlabel, color=DIM, fontsize=8, fontfamily='monospace')
+    ax.set_ylabel(ylabel, color=DIM, fontsize=8, fontfamily='monospace')
+    ax.tick_params(colors=DIM, labelsize=7)
+    ax.grid(True, color=GRID, linewidth=0.5, alpha=0.8)
+    for sp in ax.spines.values():
+        sp.set_edgecolor(BORDER); sp.set_linewidth(0.8)
+ 
+ 
+state = dict(topo='erd')
+ 
+ 
+def draw_raw():
+    ax_raw.cla()
+    style_ax(ax_raw, 'Raw EEG — Motor Cortex (C3)',
+             'Time rel. to movement (s)', 'Amplitude (μV)')
+    sig = make_beta_signal(condition='healthy', trial=5)
+    ax_raw.plot(T_REL, sig, color=BETA, linewidth=0.85, alpha=0.85)
+    ax_raw.axvline(0,              color=MOVEMENT, linewidth=1.8, linestyle='--',
+                   label='Movement onset', zorder=5)
+    ax_raw.axvline(T_END - T_MOVEMENT, color=MOVEMENT, linewidth=1.2, linestyle=':',
+                   alpha=0.7, label='Movement end', zorder=5)
+    ax_raw.axvspan(-0.5, 0,            color=ERD, alpha=0.07, label='ERD window')
+    ax_raw.axvspan(T_END - T_MOVEMENT,
+                   T_END - T_MOVEMENT + 0.9, color=ERS, alpha=0.07, label='PMBR window')
+    ax_raw.set_xlim(-1.5, 2.5)
+    ax_raw.legend(fontsize=7, facecolor=BG, edgecolor=BORDER, ncol=2)
+ 
+ 
+def draw_tfr():
+    ax_tfr.cla()
+    f, t_rel, ersp = compute_tfr(condition='healthy')
+    im = ax_tfr.imshow(
+        ersp, aspect='auto', origin='lower',
+        extent=[t_rel[0], t_rel[-1], f[0], f[-1]],
+        cmap='RdBu_r', vmin=-8, vmax=8, interpolation='bilinear'
+    )
+    ax_tfr.axvline(0, color=MOVEMENT, linewidth=1.5, linestyle='--')
+    ax_tfr.axvline(T_END - T_MOVEMENT, color=MOVEMENT, linewidth=1.0,
+                   linestyle=':', alpha=0.7)
+    ax_tfr.axhline(13, color='white', linewidth=0.6, linestyle=':', alpha=0.5)
+    ax_tfr.axhline(30, color='white', linewidth=0.6, linestyle=':', alpha=0.5)
+    ax_tfr.text(-1.0, 20, 'Beta', color='white', fontsize=7.5, fontfamily='monospace')
+    cbar = plt.colorbar(im, ax=ax_tfr, fraction=0.04, pad=0.02)
+    cbar.set_label('ERSP (dB)', color=DIM, fontsize=7, fontfamily='monospace')
+    cbar.ax.tick_params(colors=DIM, labelsize=6)
+    style_ax(ax_tfr, 'ERSP — Motor Cortex',
+             'Time rel. to movement (s)', 'Frequency (Hz)')
+    ax_tfr.grid(False)
+ 
+ 
+def draw_topo(phase='erd'):
+    ax_topo.cla()
+    ax_topo.set_facecolor(PANEL)
+    for sp in ax_topo.spines.values():
+        sp.set_edgecolor(BORDER); sp.set_linewidth(0.8)
+    grid   = compute_topography(phase)
+    cmaps  = dict(baseline='Blues', erd='RdBu_r', pmbr='Greens')
+    labels = dict(baseline='Baseline Beta', erd='ERD (suppression)',
+                  pmbr='Post-Movement Rebound')
+    im = ax_topo.imshow(grid, cmap=cmaps[phase], aspect='auto',
+                        interpolation='bicubic')
+    electrodes = {(1, 3): 'Fz', (3, 0): 'C3', (3, 3): 'Cz',
+                  (3, 6): 'C4', (5, 3): 'Pz'}
+    for (r, c), label in electrodes.items():
+        ax_topo.text(c, r, label, ha='center', va='center', fontsize=7.5,
+                     color='white', fontfamily='monospace', fontweight='bold',
+                     path_effects=[pe.withStroke(linewidth=2, foreground='black')])
+    cbar = plt.colorbar(im, ax=ax_topo, fraction=0.046, pad=0.04)
+    cbar.ax.tick_params(colors=DIM, labelsize=6)
+    ax_topo.set_title(f'Topography — {labels[phase]}', color=TEXT, fontsize=9,
+                      fontfamily='monospace', pad=7, fontweight='bold')
+    ax_topo.set_xticks([]); ax_topo.set_yticks([])
+    ax_topo.text(0.02, 0.04, 'Frontal →\nParietal', color=DIM, fontsize=6,
+                 fontfamily='monospace', transform=ax_topo.transAxes)
+ 
+ 
+def draw_timecourse():
+    ax_tc.cla()
+    style_ax(ax_tc, f'Beta Power Timecourse  (n={N_TRIALS} trials)',
+             'Time rel. to movement (s)', 'Beta power (μV²)')
+    t_rel, avg, sem = compute_beta_timecourse('healthy')
+    ax_tc.fill_between(t_rel, avg - sem, avg + sem, color=HEALTHY, alpha=0.15)
+    ax_tc.plot(t_rel, avg, color=HEALTHY, linewidth=2.0, label='Healthy')
+ 
+    base = avg[T_REL < -0.8].mean()
+    ax_tc.axhline(base, color=DIM, linewidth=0.8, linestyle=':', alpha=0.6)
+    ax_tc.axvline(0, color=MOVEMENT, linewidth=1.5, linestyle='--', label='Movement')
+    ax_tc.axvline(T_END - T_MOVEMENT, color=MOVEMENT, linewidth=1.0,
+                  linestyle=':', alpha=0.7)
+ 
+    # annotate ERD and PMBR
+    ax_tc.annotate('ERD', xy=(-0.2, avg[(T_REL > -0.3) & (T_REL < 0)].mean()),
+                   xytext=(-0.8, avg[(T_REL > -0.3) & (T_REL < 0)].mean() * 0.6),
+                   color=ERD, fontsize=8, fontfamily='monospace', fontweight='bold',
+                   arrowprops=dict(arrowstyle='->', color=ERD, lw=1.2))
+    ax_tc.annotate('PMBR', xy=(1.0, avg[(T_REL > 0.8) & (T_REL < 1.2)].mean()),
+                   xytext=(1.4, avg[(T_REL > 0.8) & (T_REL < 1.2)].mean() * 1.3),
+                   color=ERS, fontsize=8, fontfamily='monospace', fontweight='bold',
+                   arrowprops=dict(arrowstyle='->', color=ERS, lw=1.2))
+ 
+    ax_tc.set_xlim(-1.5, 2.5)
+    ax_tc.legend(fontsize=7, facecolor=BG, edgecolor=BORDER)
+ 
+ 
+def draw_pd_comparison():
+    ax_pd.cla()
+    style_ax(ax_pd, "Healthy vs Parkinson's Disease",
+             'Time rel. to movement (s)', 'Beta power (μV²)')
+    for cond, col, lbl in [
+        ('healthy',    HEALTHY, 'Healthy'),
+        ('parkinsons', PD_COL,  "Parkinson's"),
+    ]:
+        t_rel, avg, sem = compute_beta_timecourse(cond, n_trials=30)
+        ax_pd.fill_between(t_rel, avg - sem, avg + sem, color=col, alpha=0.12)
+        ax_pd.plot(t_rel, avg, color=col, linewidth=2.0, label=lbl)
+ 
+    ax_pd.axvline(0, color=MOVEMENT, linewidth=1.4, linestyle='--')
+    ax_pd.set_xlim(-1.5, 2.5)
+    ax_pd.legend(fontsize=8, facecolor=BG, edgecolor=BORDER)
+    ax_pd.text(0.04, 0.88,
+               "Elevated baseline beta in PD\ncorrelates with rigidity\nand motor freezing",
+               color=PD_COL, fontsize=7.5, fontfamily='monospace',
+               transform=ax_pd.transAxes, va='top',
+               bbox=dict(boxstyle='round,pad=0.4', facecolor='#f3e5f5',
+                         edgecolor=PD_COL, linewidth=0.8))
+ 
+ 
+def draw_info():
+    ax_info.cla()
+    ax_info.set_facecolor(PANEL)
+    for sp in ax_info.spines.values():
+        sp.set_edgecolor(BORDER); sp.set_linewidth(0.8)
+    ax_info.axis('off')
+    ax_info.set_title('Three Key Phenomena', color=TEXT, fontsize=9,
+                      fontfamily='monospace', pad=7, fontweight='bold')
+ 
+    findings = [
+        (ERD,      'ERD — PREPARATORY SUPPRESSION',
+                   'Beta drops 200-500ms BEFORE\nmovement — it is a planning\nsignal, not a movement signal.\nPredicts reaction time.'),
+        (ERS,      'PMBR — THE REBOUND',
+                   'Post-movement rebound exceeds\nbaseline. Actively suppresses\nfurther movement. "Idling\nrhythm" that resets cortex.'),
+        (PD_COL,   "PARKINSON'S PATHOLOGY",
+                   'Basal ganglia locked in high\nbeta. DBS therapy works by\ndisrupting this pathological\nhigh-beta state.'),
+    ]
+ 
+    y = 0.96
+    for col, title, body in findings:
+        ax_info.text(0.04, y, f'▸ {title}', color=col, fontsize=7,
+                     fontweight='bold', fontfamily='monospace',
+                     transform=ax_info.transAxes, va='top')
+        ax_info.text(0.04, y - 0.06, body, color=TEXT, fontsize=7,
+                     fontfamily='monospace', transform=ax_info.transAxes,
+                     va='top', linespacing=1.55)
+        y -= 0.30
+ 
+ 
+# ── buttons ───────────────────────────────────────────────────────────────────
+btn_row = gridspec.GridSpecFromSubplotSpec(
+    1, 4, subplot_spec=outer[2], wspace=0.05
+)
+ax_b = [fig.add_subplot(btn_row[i]) for i in range(4)]
+labels_btn = ['BASELINE TOPO', 'ERD TOPO', 'PMBR TOPO', 'SAVE PNG']
+cols   = ['#e3f2fd', '#ffebee', '#e8f5e9', '#fff8e1']
+btns   = []
+for ab, lbl, c in zip(ax_b, labels_btn, cols):
+    b = Button(ab, lbl, color=c, hovercolor='#e0e0e0')
+    b.label.set_color(TEXT); b.label.set_fontsize(8)
+    b.label.set_fontfamily('monospace')
+    btns.append(b)
+ 
+for i, phase in enumerate(['baseline', 'erd', 'pmbr']):
+    btns[i].on_clicked(lambda e, p=phase: (draw_topo(p), fig.canvas.draw_idle()))
+ 
+ 
+def save_png(e=None):
+    fig.savefig('beta_desynchronization_movement.png', dpi=150,
+                bbox_inches='tight', facecolor=BG)
+    print('Saved: beta_desynchronization_movement.png')
+ 
+ 
+btns[3].on_clicked(save_png)
+ 
+# ── render ────────────────────────────────────────────────────────────────────
+draw_raw(); draw_tfr(); draw_topo('erd')
+draw_timecourse(); draw_pd_comparison(); draw_info()
+ 
+plt.savefig('beta_desynchronization_movement.png', dpi=150,
+            bbox_inches='tight', facecolor=BG)
+print('Saved: beta_desynchronization_movement.png')
+ 
+plt.show()
+ 

@@ -1,0 +1,474 @@
+"""
+alpha_wave_suppression.py
+--------------------------
+Alpha waves (8-12 Hz) are the brain's default idle rhythm —
+they dominate when your eyes are closed and visual cortex is
+not processing anything. The moment a visual stimulus appears,
+alpha power drops sharply. This suppression is not a passive
+absence of signal. It is an active gate: the visual cortex
+releases inhibition to allow incoming information through.
+ 
+This is one of the most robust findings in EEG research.
+Every human shows it. Every time.
+ 
+What makes it interesting:
+- The suppression is spatially specific: occipital alpha drops,
+  but frontal alpha can actually increase (active inhibition
+  of distractor processing)
+- The depth of suppression predicts whether you will consciously
+  see a near-threshold stimulus (Ergenoglu et al. 2004)
+- Alpha is not noise — it is a functional rhythm that gates
+  information flow across the cortex
+ 
+References:
+  - Berger (1929) Arch Psychiatr Nervenkr 87:527  — original discovery
+  - Pfurtscheller & Lopes da Silva (1999) Clin Neurophysiol 110:1842
+  - Ergenoglu et al. (2004) Exp Brain Res 158:177
+  - Jensen & Mazaheri (2010) Front Hum Neurosci 4:190
+  - Worden et al. (2000) J Neurosci 20:RC63
+ 
+pip install matplotlib numpy scipy
+"""
+ 
+import numpy as np
+import matplotlib.pyplot as plt
+import matplotlib.gridspec as gridspec
+from matplotlib.patches import FancyBboxPatch
+import matplotlib.patheffects as pe
+from matplotlib.widgets import Button
+from scipy import signal as scipy_signal
+ 
+np.random.seed(7)
+ 
+# ── palette — white background, clean scientific aesthetic ────────────────────
+BG        = '#ffffff'
+PANEL     = '#f8f9fa'
+BORDER    = '#dee2e6'
+ALPHA_COL = '#2196f3'    # blue for alpha
+SUPPRESS  = '#e53935'    # red for suppression
+STIM_COL  = '#ff6f00'    # orange for stimulus
+BASELINE  = '#78909c'    # grey for baseline
+TEXT      = '#1a1a2e'
+DIM       = '#6c757d'
+GRID      = '#e9ecef'
+GREEN     = '#2e7d32'
+PURPLE    = '#6a1b9a'
+ 
+# ── signal generation ─────────────────────────────────────────────────────────
+FS        = 500      # sampling rate Hz
+T_TOTAL   = 3.0      # seconds
+T_STIM    = 1.0      # stimulus onset at 1s
+N_TRIALS  = 40
+N_CHANS   = 8        # simulated occipital channels
+ 
+T_AXIS    = np.linspace(0, T_TOTAL, int(FS * T_TOTAL))
+T_REL     = T_AXIS - T_STIM   # relative to stimulus
+ 
+ 
+def make_alpha_signal(suppress=True, channel=0, trial=0):
+    """
+    Generate a realistic EEG-like signal with alpha rhythm.
+    Pre-stimulus: strong alpha (8-12 Hz).
+    Post-stimulus: alpha suppressed, broadband activity increases.
+    """
+    rng  = np.random.default_rng(seed=channel * 31 + trial * 7)
+    t    = T_AXIS
+    n    = len(t)
+ 
+    # individual channel frequency variation (9-11 Hz)
+    alpha_freq = 9.5 + rng.uniform(-0.8, 0.8) + channel * 0.15
+ 
+    # amplitude variation across channels and trials
+    pre_amp  = 8.0 + rng.uniform(-1.5, 1.5)
+    post_amp = pre_amp * (0.25 + rng.uniform(-0.08, 0.08)) if suppress else pre_amp
+ 
+    # build signal in segments
+    sig = np.zeros(n)
+    stim_idx = int(T_STIM * FS)
+ 
+    # pre-stimulus: strong alpha
+    t_pre = t[:stim_idx]
+    phase_pre = rng.uniform(0, 2 * np.pi)
+    sig[:stim_idx] = (
+        pre_amp * np.sin(2 * np.pi * alpha_freq * t_pre + phase_pre) +
+        rng.normal(0, 1.2, stim_idx)
+    )
+ 
+    # transition: brief 50-100ms of mixed activity
+    trans_len = int(0.08 * FS)
+    fade = np.linspace(1, 0, trans_len)
+    sig[stim_idx:stim_idx + trans_len] = (
+        pre_amp * fade * np.sin(2 * np.pi * alpha_freq * t[stim_idx:stim_idx + trans_len] + phase_pre) +
+        rng.normal(0, 2.5, trans_len)
+    )
+ 
+    # post-stimulus: suppressed alpha + broadband evoked activity
+    t_post = t[stim_idx + trans_len:]
+    n_post = len(t_post)
+    evoked_decay = np.exp(-t_post[:n_post] / 0.3) * 15 * np.sin(
+        2 * np.pi * 3 * t_post[:n_post]
+    ) * (1 if suppress else 0.3)
+ 
+    sig[stim_idx + trans_len:] = (
+        post_amp * np.sin(2 * np.pi * alpha_freq * t_post + rng.uniform(0, 2 * np.pi)) +
+        evoked_decay +
+        rng.normal(0, 2.0 if suppress else 1.2, n_post)
+    )
+ 
+    return sig
+ 
+ 
+def compute_tfr(sig, fs=FS):
+    """Time-frequency representation using short-time Fourier transform."""
+    nperseg  = 128
+    noverlap = 120
+    f, t_spec, Sxx = scipy_signal.spectrogram(
+        sig, fs=fs, nperseg=nperseg, noverlap=noverlap, scaling='density'
+    )
+    return f, t_spec, 10 * np.log10(Sxx + 1e-10)
+ 
+ 
+def compute_ersp(n_trials=N_TRIALS, channel=0):
+    """
+    Event-related spectral perturbation — average power change
+    across trials, relative to pre-stimulus baseline.
+    This is the standard way to show alpha suppression in EEG papers.
+    """
+    nperseg  = 128
+    noverlap = 120
+    powers   = []
+ 
+    for trial in range(n_trials):
+        sig = make_alpha_signal(suppress=True, channel=channel, trial=trial)
+        f, t_spec, Sxx_db = compute_tfr(sig)
+        powers.append(Sxx_db)
+ 
+    avg_power = np.mean(powers, axis=0)
+ 
+    # baseline: pre-stimulus period
+    stim_t   = T_STIM
+    base_mask = t_spec < stim_t - 0.1
+    baseline  = avg_power[:, base_mask].mean(axis=1, keepdims=True)
+    ersp      = avg_power - baseline   # dB change from baseline
+ 
+    return f, t_spec - T_STIM, ersp   # shift time to stimulus-relative
+ 
+ 
+def compute_alpha_timecourse(n_trials=N_TRIALS, channel=0):
+    """
+    Band-pass filter at 8-12 Hz, extract instantaneous power via Hilbert,
+    average across trials. Standard EEG analysis pipeline.
+    """
+    b, a = scipy_signal.butter(4, [8, 12], btype='bandpass', fs=FS)
+    powers = []
+ 
+    for trial in range(n_trials):
+        sig       = make_alpha_signal(suppress=True, channel=channel, trial=trial)
+        filtered  = scipy_signal.filtfilt(b, a, sig)
+        analytic  = scipy_signal.hilbert(filtered)
+        power     = np.abs(analytic) ** 2
+        powers.append(power)
+ 
+    avg = np.mean(powers, axis=0)
+    sem = np.std(powers, axis=0) / np.sqrt(n_trials)
+    return T_REL, avg, sem
+ 
+ 
+def compute_topography(time_window='post'):
+    """
+    Simulated 2D scalp topography of alpha power.
+    Pre-stimulus: posterior alpha dominant.
+    Post-stimulus: posterior drops, frontal relatively preserved.
+    """
+    # 8x8 grid approximating scalp
+    grid = np.zeros((8, 8))
+    rng  = np.random.default_rng(seed=42)
+ 
+    if time_window == 'pre':
+        # strong occipital / parietal alpha
+        for i in range(8):
+            for j in range(8):
+                dist_occ = np.sqrt((i - 6.5)**2 + (j - 3.5)**2)
+                grid[i, j] = np.exp(-dist_occ / 2.5) * 8 + rng.uniform(0, 0.5)
+    else:
+        # post: occipital suppressed, frontal relatively preserved
+        for i in range(8):
+            for j in range(8):
+                dist_occ   = np.sqrt((i - 6.5)**2 + (j - 3.5)**2)
+                dist_front = np.sqrt((i - 0.5)**2 + (j - 3.5)**2)
+                grid[i, j] = (
+                    np.exp(-dist_occ / 2.5) * 1.5 +
+                    np.exp(-dist_front / 2.0) * 3.0 +
+                    rng.uniform(0, 0.3)
+                )
+    return grid
+ 
+ 
+# ── figure ────────────────────────────────────────────────────────────────────
+fig = plt.figure(figsize=(16, 10), facecolor=BG)
+fig.canvas.manager.set_window_title('Alpha Wave Suppression — Visual Stimulus Onset')
+ 
+outer = gridspec.GridSpec(
+    3, 1, figure=fig,
+    height_ratios=[0.08, 0.85, 0.07],
+    hspace=0.12,
+    left=0.05, right=0.97, top=0.94, bottom=0.04
+)
+ 
+# header
+ax_hdr = fig.add_subplot(outer[0])
+ax_hdr.set_facecolor(BG); ax_hdr.axis('off')
+ax_hdr.text(0.0, 0.82, 'Alpha Wave Suppression  (8–12 Hz)',
+            color=TEXT, fontsize=18, fontweight='bold',
+            fontfamily='monospace', transform=ax_hdr.transAxes)
+ax_hdr.text(0.0, 0.18,
+            'Event-Related Desynchronization · Visual Cortex Gating · '
+            'Pfurtscheller & Lopes da Silva (1999)  ·  Jensen & Mazaheri (2010)',
+            color=DIM, fontsize=9, fontfamily='monospace',
+            transform=ax_hdr.transAxes)
+ 
+inner = gridspec.GridSpecFromSubplotSpec(
+    2, 3, subplot_spec=outer[1],
+    hspace=0.55, wspace=0.38,
+    height_ratios=[1, 1]
+)
+ 
+ax_raw    = fig.add_subplot(inner[0, 0])
+ax_tfr    = fig.add_subplot(inner[0, 1])
+ax_topo   = fig.add_subplot(inner[0, 2])
+ax_tc     = fig.add_subplot(inner[1, 0])
+ax_ersp   = fig.add_subplot(inner[1, 1])
+ax_info   = fig.add_subplot(inner[1, 2])
+ 
+for ax in [ax_raw, ax_tfr, ax_topo, ax_tc, ax_ersp, ax_info]:
+    ax.set_facecolor(PANEL)
+    for sp in ax.spines.values():
+        sp.set_edgecolor(BORDER); sp.set_linewidth(0.8)
+ 
+ 
+def style_ax(ax, title, xlabel='', ylabel=''):
+    ax.set_title(title, color=TEXT, fontsize=9, fontfamily='monospace',
+                 pad=7, fontweight='bold')
+    ax.set_xlabel(xlabel, color=DIM, fontsize=8, fontfamily='monospace')
+    ax.set_ylabel(ylabel, color=DIM, fontsize=8, fontfamily='monospace')
+    ax.tick_params(colors=DIM, labelsize=7)
+    ax.grid(True, color=GRID, linewidth=0.5, alpha=0.8)
+    for sp in ax.spines.values():
+        sp.set_edgecolor(BORDER); sp.set_linewidth(0.8)
+ 
+ 
+# ── draw functions ────────────────────────────────────────────────────────────
+ 
+def draw_raw():
+    ax_raw.cla()
+    style_ax(ax_raw, 'Raw EEG — Single Trial (Oz)',
+             'Time (s)', 'Amplitude (μV)')
+ 
+    sig = make_alpha_signal(suppress=True, channel=0, trial=3)
+    ax_raw.plot(T_REL, sig, color=ALPHA_COL, linewidth=0.9, alpha=0.9)
+    ax_raw.axvline(0, color=STIM_COL, linewidth=1.8, linestyle='--', zorder=5)
+    ax_raw.text(0.02, ax_raw.get_ylim()[1] * 0.85 if ax_raw.get_ylim()[1] > 0 else 10,
+                'Stimulus\nonset', color=STIM_COL, fontsize=7.5,
+                fontfamily='monospace')
+ 
+    # annotate pre and post regions
+    ax_raw.axvspan(-1.0, 0, color=ALPHA_COL, alpha=0.06, label='Pre: strong alpha')
+    ax_raw.axvspan(0, 2.0,  color=SUPPRESS,  alpha=0.05, label='Post: alpha suppressed')
+    ax_raw.set_xlim(-1.0, 2.0)
+    ax_raw.legend(fontsize=7, facecolor=BG, edgecolor=BORDER, loc='lower right')
+ 
+ 
+def draw_tfr():
+    ax_tfr.cla()
+    sig   = make_alpha_signal(suppress=True, channel=0, trial=3)
+    f, t_spec, Sxx = compute_tfr(sig)
+    t_rel_spec = t_spec - T_STIM
+ 
+    # focus on 2-30 Hz
+    f_mask = (f >= 2) & (f <= 30)
+ 
+    im = ax_tfr.imshow(
+        Sxx[f_mask],
+        aspect='auto', origin='lower',
+        extent=[t_rel_spec[0], t_rel_spec[-1], f[f_mask][0], f[f_mask][-1]],
+        cmap='RdBu_r', vmin=-15, vmax=15,
+        interpolation='bilinear'
+    )
+    ax_tfr.axvline(0, color=STIM_COL, linewidth=1.5, linestyle='--')
+    ax_tfr.axhline(8,  color='white', linewidth=0.6, linestyle=':', alpha=0.6)
+    ax_tfr.axhline(12, color='white', linewidth=0.6, linestyle=':', alpha=0.6)
+    ax_tfr.text(0.5, 9.8, 'Alpha band', color='white', fontsize=7,
+                fontfamily='monospace', alpha=0.85)
+ 
+    cbar = plt.colorbar(im, ax=ax_tfr, fraction=0.04, pad=0.02)
+    cbar.set_label('Power (dB)', color=DIM, fontsize=7, fontfamily='monospace')
+    cbar.ax.tick_params(colors=DIM, labelsize=6)
+ 
+    style_ax(ax_tfr, 'Time-Frequency Representation',
+             'Time rel. to stimulus (s)', 'Frequency (Hz)')
+    ax_tfr.grid(False)
+ 
+ 
+def draw_topo(time_window='post'):
+    ax_topo.cla()
+    ax_topo.set_facecolor(PANEL)
+    for sp in ax_topo.spines.values():
+        sp.set_edgecolor(BORDER); sp.set_linewidth(0.8)
+ 
+    grid = compute_topography(time_window)
+    im   = ax_topo.imshow(grid, cmap='Blues' if time_window == 'pre' else 'RdBu_r',
+                          aspect='auto', interpolation='bicubic',
+                          vmin=0 if time_window == 'pre' else -3)
+ 
+    # electrode labels
+    regions = {(0, 3): 'Fz', (3, 0): 'T7', (3, 7): 'T8',
+               (3, 3): 'Cz', (6, 1): 'O1', (6, 5): 'O2', (6, 3): 'Oz'}
+    for (r, c), label in regions.items():
+        ax_topo.text(c, r, label, ha='center', va='center', fontsize=7,
+                     color='white', fontfamily='monospace', fontweight='bold',
+                     path_effects=[pe.withStroke(linewidth=1.5, foreground='black')])
+ 
+    cbar = plt.colorbar(im, ax=ax_topo, fraction=0.046, pad=0.04)
+    cbar.set_label('Alpha power', color=DIM, fontsize=7, fontfamily='monospace')
+    cbar.ax.tick_params(colors=DIM, labelsize=6)
+ 
+    label = 'Pre-stimulus' if time_window == 'pre' else 'Post-stimulus'
+    ax_topo.set_title(f'Scalp Topography — {label}',
+                      color=TEXT, fontsize=9, fontfamily='monospace',
+                      pad=7, fontweight='bold')
+    ax_topo.set_xticks([]); ax_topo.set_yticks([])
+    ax_topo.text(0.02, 0.04, 'Frontal →\nOccipital', color=DIM, fontsize=6.5,
+                 fontfamily='monospace', transform=ax_topo.transAxes, va='bottom')
+ 
+ 
+def draw_timecourse():
+    ax_tc.cla()
+    style_ax(ax_tc, f'Alpha Power Timecourse  (n={N_TRIALS} trials)',
+             'Time rel. to stimulus (s)', 'Alpha power (μV²)')
+ 
+    t_rel, avg, sem = compute_alpha_timecourse(n_trials=N_TRIALS, channel=0)
+ 
+    # smooth for display
+    from scipy.ndimage import uniform_filter1d
+    avg_s = uniform_filter1d(avg, size=30)
+    sem_s = uniform_filter1d(sem, size=30)
+ 
+    ax_tc.fill_between(t_rel, avg_s - sem_s, avg_s + sem_s,
+                       color=ALPHA_COL, alpha=0.18, label='±SEM')
+    ax_tc.plot(t_rel, avg_s, color=ALPHA_COL, linewidth=2.0, label='Mean alpha power')
+ 
+    # baseline rectangle
+    ax_tc.axvspan(-0.5, 0, color=ALPHA_COL, alpha=0.07, label='Baseline window')
+    ax_tc.axvline(0, color=STIM_COL, linewidth=1.5, linestyle='--', label='Stimulus onset')
+    ax_tc.axhline(avg_s[T_REL < -0.1].mean(), color=BASELINE,
+                  linewidth=1.0, linestyle=':', alpha=0.7, label='Pre-stimulus mean')
+ 
+    ax_tc.set_xlim(-1.0, 2.0)
+    ax_tc.legend(fontsize=7, facecolor=BG, edgecolor=BORDER, ncol=2)
+ 
+    # annotate suppression
+    post_mean  = avg_s[(T_REL > 0.2) & (T_REL < 0.8)].mean()
+    pre_mean   = avg_s[T_REL < -0.1].mean()
+    pct_change = (post_mean - pre_mean) / pre_mean * 100
+    ax_tc.text(0.55, 0.15, f'ERD: {pct_change:.0f}%',
+               color=SUPPRESS, fontsize=9, fontweight='bold',
+               fontfamily='monospace', transform=ax_tc.transAxes)
+ 
+ 
+def draw_ersp():
+    ax_ersp.cla()
+    f, t_spec, ersp = compute_ersp(n_trials=N_TRIALS, channel=0)
+    f_mask = (f >= 2) & (f <= 30)
+ 
+    im = ax_ersp.imshow(
+        ersp[f_mask],
+        aspect='auto', origin='lower',
+        extent=[t_spec[0], t_spec[-1], f[f_mask][0], f[f_mask][-1]],
+        cmap='RdBu_r', vmin=-6, vmax=6,
+        interpolation='bilinear'
+    )
+    ax_ersp.axvline(0, color=STIM_COL, linewidth=1.5, linestyle='--')
+    ax_ersp.axhline(8,  color='white', linewidth=0.7, linestyle=':', alpha=0.5)
+    ax_ersp.axhline(12, color='white', linewidth=0.7, linestyle=':', alpha=0.5)
+ 
+    cbar = plt.colorbar(im, ax=ax_ersp, fraction=0.04, pad=0.02)
+    cbar.set_label('ERSP (dB)', color=DIM, fontsize=7, fontfamily='monospace')
+    cbar.ax.tick_params(colors=DIM, labelsize=6)
+ 
+    style_ax(ax_ersp, f'ERSP — Trial Average  (n={N_TRIALS})',
+             'Time rel. to stimulus (s)', 'Frequency (Hz)')
+    ax_ersp.grid(False)
+    ax_ersp.text(0.35, 9.5, 'Alpha\nsuppression', color='white', fontsize=7,
+                 fontfamily='monospace', ha='center')
+ 
+ 
+def draw_info():
+    ax_info.cla()
+    ax_info.set_facecolor(PANEL)
+    for sp in ax_info.spines.values():
+        sp.set_edgecolor(BORDER); sp.set_linewidth(0.8)
+    ax_info.axis('off')
+    ax_info.set_title('Key Findings', color=TEXT, fontsize=9,
+                      fontfamily='monospace', pad=7, fontweight='bold')
+ 
+    findings = [
+        (ALPHA_COL, 'EVENT-RELATED DESYNCHRONIZATION',
+                    'Alpha power drops 20–80% within\n100–200ms of stimulus onset.\nThis is one of the most reliable\nsignals in human EEG.'),
+        (SUPPRESS,  'SPATIAL SPECIFICITY',
+                    'Occipital/parietal alpha suppresses.\nFrontal alpha can INCREASE —\nactively inhibiting distractor\nprocessing (Jensen 2010).'),
+        (GREEN,     'PERCEPTUAL GATING',
+                    'Pre-stimulus alpha amplitude\npredicts conscious detection.\nHigh alpha before stimulus →\nlower detection rate (Ergenoglu 2004).'),
+    ]
+ 
+    y = 0.96
+    for col, title, body in findings:
+        ax_info.text(0.04, y, f'▸ {title}', color=col, fontsize=7.2,
+                     fontweight='bold', fontfamily='monospace',
+                     transform=ax_info.transAxes, va='top')
+        ax_info.text(0.04, y - 0.06, body, color=TEXT, fontsize=7,
+                     fontfamily='monospace', transform=ax_info.transAxes,
+                     va='top', linespacing=1.55)
+        y -= 0.30
+ 
+ 
+# ── buttons ───────────────────────────────────────────────────────────────────
+btn_row = gridspec.GridSpecFromSubplotSpec(
+    1, 3, subplot_spec=outer[2], wspace=0.06
+)
+ax_b = [fig.add_subplot(btn_row[i]) for i in range(3)]
+ 
+btn_pre  = Button(ax_b[0], 'PRE-STIMULUS TOPO',  color='#e3f2fd', hovercolor='#bbdefb')
+btn_post = Button(ax_b[1], 'POST-STIMULUS TOPO', color='#fce4ec', hovercolor='#f8bbd9')
+btn_save = Button(ax_b[2], 'SAVE PNG',           color='#e8f5e9', hovercolor='#c8e6c9')
+ 
+for btn in [btn_pre, btn_post, btn_save]:
+    btn.label.set_color(TEXT); btn.label.set_fontsize(8)
+    btn.label.set_fontfamily('monospace')
+ 
+state = dict(topo='post')
+ 
+btn_pre.on_clicked(lambda e: (state.update(topo='pre'), draw_topo('pre'), fig.canvas.draw_idle()))
+btn_post.on_clicked(lambda e: (state.update(topo='post'), draw_topo('post'), fig.canvas.draw_idle()))
+ 
+ 
+def save_png(e=None):
+    fig.savefig('alpha_wave_suppression.png', dpi=150,
+                bbox_inches='tight', facecolor=BG)
+    print('Saved: alpha_wave_suppression.png')
+ 
+ 
+btn_save.on_clicked(save_png)
+ 
+# ── render ────────────────────────────────────────────────────────────────────
+draw_raw()
+draw_tfr()
+draw_topo('post')
+draw_timecourse()
+draw_ersp()
+draw_info()
+ 
+plt.savefig('alpha_wave_suppression.png', dpi=150,
+            bbox_inches='tight', facecolor=BG)
+print('Saved: alpha_wave_suppression.png')
+ 
+plt.show()

@@ -1,0 +1,465 @@
+amma coupling · PY
+Copy
+
+"""
+theta_gamma_coupling.py
+------------------------
+One of the most elegant mechanisms in systems neuroscience.
+ 
+Theta oscillations (4-8 Hz) in the hippocampus create a slow
+carrier wave — about 125ms per cycle. Within each theta cycle,
+multiple bursts of gamma (30-80 Hz) can occur. Each gamma burst
+is short enough (15-30ms) that several of them fit within a
+single theta cycle.
+ 
+The result: the hippocampus can encode different items in
+different gamma sub-windows within a single theta cycle.
+This is the neural mechanism for holding multiple items in
+working memory simultaneously — a temporal multiplexing strategy.
+ 
+Lisman & Idiart (1995) first proposed this. Subsequent work
+has shown it predicts memory capacity (Miller's magical number 7
+±2 corresponds to roughly 7 gamma cycles per theta cycle).
+Axmacher et al. (2010) showed it in humans during working
+memory tasks using intracranial EEG.
+ 
+This visualization shows:
+1. The raw coupled signal
+2. Phase-amplitude coupling (PAC) — the comodulogram
+3. Theta phase vs gamma amplitude relationship
+4. Multiple-item encoding model
+5. Memory load effect on coupling strength
+6. Comparison: encoding vs retrieval
+ 
+References:
+  - Lisman & Idiart (1995) Science 267:1512
+  - Buzsaki (2002) Neuron 33:325
+  - Axmacher et al. (2010) PNAS 107:3228
+  - Canolty et al. (2006) Science 313:1626  — PAC measurement
+  - Jensen & Lisman (2005) Hippocampus 15:935
+ 
+pip install matplotlib numpy scipy
+"""
+ 
+import numpy as np
+import matplotlib.pyplot as plt
+import matplotlib.gridspec as gridspec
+from scipy import signal as scipy_signal
+from scipy.ndimage import uniform_filter1d
+from matplotlib.widgets import Button
+import matplotlib.patheffects as pe
+ 
+np.random.seed(5)
+ 
+# ── palette ───────────────────────────────────────────────────────────────────
+BG      = '#ffffff'
+PANEL   = '#f8f9fa'
+BORDER  = '#dee2e6'
+THETA   = '#1565c0'    # blue  — theta
+GAMMA   = '#c62828'    # red   — gamma
+COUPLED = '#4a148c'    # purple — coupled signal
+ITEM_COLORS = ['#e53935', '#fb8c00', '#43a047', '#00897b',
+               '#1e88e5', '#8e24aa', '#f06292']
+TEXT    = '#1a1a2e'
+DIM     = '#6c757d'
+GRID    = '#e9ecef'
+GREEN   = '#1b5e20'
+ORANGE  = '#e65100'
+ 
+# ── constants ─────────────────────────────────────────────────────────────────
+FS         = 1000
+T_TOTAL    = 2.0
+T_AXIS     = np.linspace(0, T_TOTAL, int(FS * T_TOTAL))
+THETA_FREQ = 6.0    # Hz — typical hippocampal theta
+GAMMA_FREQ = 50.0   # Hz — gamma carrier
+ 
+ 
+def make_theta_gamma_signal(n_items=4, noise_level=0.8):
+    """
+    Generate theta-gamma coupled signal.
+    Each theta cycle contains n_items gamma bursts at specific phases.
+    The gamma bursts represent distinct memory items being held active.
+    """
+    rng = np.random.default_rng(seed=n_items * 13)
+    t   = T_AXIS
+    n   = len(t)
+ 
+    # theta carrier
+    theta = np.sin(2 * np.pi * THETA_FREQ * t)
+ 
+    # gamma amplitude modulated by theta phase
+    # bursts at specific theta phases, one per item
+    gamma_component = np.zeros(n)
+ 
+    theta_period = 1.0 / THETA_FREQ   # seconds per theta cycle
+    n_cycles     = int(T_TOTAL * THETA_FREQ)
+ 
+    for cycle in range(n_cycles):
+        cycle_start = cycle * theta_period
+        for item in range(n_items):
+            # each item fires at a specific phase within the theta cycle
+            phase_offset = item / n_items   # 0 to 1 within cycle
+            burst_t      = cycle_start + phase_offset * theta_period
+            burst_idx    = int(burst_t * FS)
+            burst_len    = int(0.020 * FS)   # 20ms gamma burst
+ 
+            if burst_idx + burst_len < n:
+                t_burst    = t[burst_idx:burst_idx + burst_len] - burst_t
+                amplitude  = 3.5 * np.exp(-t_burst ** 2 / (2 * 0.008 ** 2))
+                phase_rand = rng.uniform(0, 2 * np.pi)
+                gamma_component[burst_idx:burst_idx + burst_len] += (
+                    amplitude * np.sin(2 * np.pi * GAMMA_FREQ * t_burst + phase_rand)
+                )
+ 
+    # combine theta envelope + gamma + noise
+    theta_envelope = (1 + 0.5 * theta) * 2   # theta modulates gamma amplitude
+    signal = (
+        3.0 * theta +
+        gamma_component +
+        rng.normal(0, noise_level, n)
+    )
+ 
+    return signal, theta, gamma_component
+ 
+ 
+def compute_pac_comodulogram(sig, fs=FS, n_phase_bins=18):
+    """
+    Phase-Amplitude Coupling comodulogram.
+    For each (phase_freq, amplitude_freq) pair, compute the
+    mean amplitude of the high-freq signal at each phase of
+    the low-freq signal. Strong coupling = clear modulation.
+    Uses the mean vector length (MVL) method — Canolty 2006.
+    """
+    phase_freqs = np.arange(2, 20, 2)     # 2-18 Hz
+    amp_freqs   = np.arange(20, 100, 5)   # 20-95 Hz
+    pac_matrix  = np.zeros((len(amp_freqs), len(phase_freqs)))
+ 
+    for i, pf in enumerate(phase_freqs):
+        b_p, a_p = scipy_signal.butter(3, [pf - 1, pf + 1], btype='bandpass', fs=fs)
+        phase_sig = scipy_signal.filtfilt(b_p, a_p, sig)
+        phase     = np.angle(scipy_signal.hilbert(phase_sig))
+ 
+        for j, af in enumerate(amp_freqs):
+            b_a, a_a = scipy_signal.butter(3, [af - 4, af + 4], btype='bandpass', fs=fs)
+            amp_sig  = scipy_signal.filtfilt(b_a, a_a, sig)
+            amp      = np.abs(scipy_signal.hilbert(amp_sig))
+            # MVL: how much does amplitude cluster at a particular phase
+            mvl      = np.abs(np.mean(amp * np.exp(1j * phase)))
+            pac_matrix[j, i] = mvl
+ 
+    return phase_freqs, amp_freqs, pac_matrix
+ 
+ 
+def compute_phase_amplitude_relationship(sig, fs=FS, n_bins=36):
+    """
+    Sort gamma amplitude by theta phase — the direct visualization
+    of coupling. Shows that gamma peaks at a specific theta phase.
+    """
+    # extract theta phase
+    b_t, a_t = scipy_signal.butter(4, [4, 8], btype='bandpass', fs=fs)
+    theta_filt = scipy_signal.filtfilt(b_t, a_t, sig)
+    theta_phase = np.angle(scipy_signal.hilbert(theta_filt))
+ 
+    # extract gamma amplitude
+    b_g, a_g = scipy_signal.butter(4, [30, 70], btype='bandpass', fs=fs)
+    gamma_filt = scipy_signal.filtfilt(b_g, a_g, sig)
+    gamma_amp  = np.abs(scipy_signal.hilbert(gamma_filt))
+ 
+    # bin gamma amplitude by theta phase
+    phase_bins = np.linspace(-np.pi, np.pi, n_bins + 1)
+    amp_by_phase = np.zeros(n_bins)
+    for k in range(n_bins):
+        mask = (theta_phase >= phase_bins[k]) & (theta_phase < phase_bins[k + 1])
+        if mask.sum() > 0:
+            amp_by_phase[k] = gamma_amp[mask].mean()
+ 
+    bin_centers = (phase_bins[:-1] + phase_bins[1:]) / 2
+    return bin_centers, amp_by_phase
+ 
+ 
+# ── figure ────────────────────────────────────────────────────────────────────
+fig = plt.figure(figsize=(16, 10), facecolor=BG)
+fig.canvas.manager.set_window_title(
+    'Theta-Gamma Coupling — Hippocampal Memory Encoding'
+)
+ 
+outer = gridspec.GridSpec(
+    3, 1, figure=fig,
+    height_ratios=[0.08, 0.85, 0.07],
+    hspace=0.12,
+    left=0.05, right=0.97, top=0.94, bottom=0.04
+)
+ 
+ax_hdr = fig.add_subplot(outer[0])
+ax_hdr.set_facecolor(BG); ax_hdr.axis('off')
+ax_hdr.text(0.0, 0.82, 'Theta–Gamma Coupling  —  Hippocampal Memory Encoding',
+            color=TEXT, fontsize=16, fontweight='bold',
+            fontfamily='monospace', transform=ax_hdr.transAxes)
+ax_hdr.text(0.0, 0.18,
+            'Phase-Amplitude Coupling · Temporal Multiplexing · '
+            'Lisman & Idiart (1995)  ·  Canolty et al. (2006)  ·  Axmacher et al. (2010)',
+            color=DIM, fontsize=9, fontfamily='monospace',
+            transform=ax_hdr.transAxes)
+ 
+inner = gridspec.GridSpecFromSubplotSpec(
+    2, 3, subplot_spec=outer[1],
+    hspace=0.55, wspace=0.38,
+    height_ratios=[1, 1]
+)
+ 
+ax_raw   = fig.add_subplot(inner[0, 0])
+ax_pac   = fig.add_subplot(inner[0, 1])
+ax_phase = fig.add_subplot(inner[0, 2])
+ax_model = fig.add_subplot(inner[1, 0])
+ax_load  = fig.add_subplot(inner[1, 1])
+ax_info  = fig.add_subplot(inner[1, 2])
+ 
+for ax in [ax_raw, ax_pac, ax_phase, ax_model, ax_load, ax_info]:
+    ax.set_facecolor(PANEL)
+    for sp in ax.spines.values():
+        sp.set_edgecolor(BORDER); sp.set_linewidth(0.8)
+ 
+ 
+def style_ax(ax, title, xlabel='', ylabel=''):
+    ax.set_title(title, color=TEXT, fontsize=9, fontfamily='monospace',
+                 pad=7, fontweight='bold')
+    ax.set_xlabel(xlabel, color=DIM, fontsize=8, fontfamily='monospace')
+    ax.set_ylabel(ylabel, color=DIM, fontsize=8, fontfamily='monospace')
+    ax.tick_params(colors=DIM, labelsize=7)
+    ax.grid(True, color=GRID, linewidth=0.5, alpha=0.8)
+    for sp in ax.spines.values():
+        sp.set_edgecolor(BORDER); sp.set_linewidth(0.8)
+ 
+ 
+def draw_raw(n_items=4):
+    ax_raw.cla()
+    style_ax(ax_raw, f'Theta–Gamma Signal  ({n_items} items)',
+             'Time (s)', 'Amplitude (μV)')
+ 
+    sig, theta, gamma_comp = make_theta_gamma_signal(n_items=n_items)
+ 
+    # show first 600ms for clarity
+    mask = T_AXIS < 0.6
+    t_show = T_AXIS[mask]
+ 
+    ax_raw.plot(t_show, sig[mask],    color=COUPLED, linewidth=1.0,
+                alpha=0.85, label='Coupled signal', zorder=3)
+    ax_raw.plot(t_show, theta[mask] * 3.5, color=THETA, linewidth=1.5,
+                alpha=0.6, linestyle='--', label='Theta (×3.5)', zorder=2)
+ 
+    # highlight individual gamma bursts
+    theta_period = 1.0 / THETA_FREQ
+    for cycle in range(3):
+        for item in range(n_items):
+            burst_t   = cycle * theta_period + item / n_items * theta_period
+            if burst_t < 0.6:
+                ax_raw.axvspan(burst_t, burst_t + 0.02,
+                               color=ITEM_COLORS[item % len(ITEM_COLORS)],
+                               alpha=0.25, zorder=1)
+                if cycle == 0:
+                    ax_raw.text(burst_t + 0.005, 8,
+                                f'#{item+1}', color=ITEM_COLORS[item % len(ITEM_COLORS)],
+                                fontsize=6.5, fontfamily='monospace', fontweight='bold')
+ 
+    ax_raw.set_xlim(0, 0.6)
+    ax_raw.legend(fontsize=7, facecolor=BG, edgecolor=BORDER)
+    ax_raw.text(0.60, 0.88, f'7±2 items\nmax capacity',
+                color=DIM, fontsize=7, fontfamily='monospace',
+                transform=ax_raw.transAxes, ha='right', va='top')
+ 
+ 
+def draw_pac(n_items=4):
+    ax_pac.cla()
+    sig, _, _ = make_theta_gamma_signal(n_items=n_items)
+    phase_freqs, amp_freqs, pac = compute_pac_comodulogram(sig)
+ 
+    im = ax_pac.imshow(
+        pac, aspect='auto', origin='lower',
+        extent=[phase_freqs[0], phase_freqs[-1], amp_freqs[0], amp_freqs[-1]],
+        cmap='hot', interpolation='bicubic'
+    )
+    ax_pac.axvline(THETA_FREQ, color='cyan', linewidth=1.2, linestyle='--', alpha=0.8)
+    ax_pac.axhline(GAMMA_FREQ, color='cyan', linewidth=1.2, linestyle='--', alpha=0.8)
+    ax_pac.text(THETA_FREQ + 0.3, GAMMA_FREQ + 3, f'θ={THETA_FREQ}Hz\nγ={int(GAMMA_FREQ)}Hz',
+                color='cyan', fontsize=7, fontfamily='monospace')
+ 
+    cbar = plt.colorbar(im, ax=ax_pac, fraction=0.04, pad=0.02)
+    cbar.set_label('MVL (coupling)', color=DIM, fontsize=7, fontfamily='monospace')
+    cbar.ax.tick_params(colors=DIM, labelsize=6)
+    style_ax(ax_pac, 'PAC Comodulogram',
+             'Phase frequency (Hz)', 'Amplitude frequency (Hz)')
+    ax_pac.grid(False)
+ 
+ 
+def draw_phase(n_items=4):
+    ax_phase.cla()
+    style_ax(ax_phase, 'Gamma Amplitude by Theta Phase',
+             'Theta phase (rad)', 'Mean gamma amplitude')
+ 
+    sig, _, _ = make_theta_gamma_signal(n_items=n_items)
+    bins, amp = compute_phase_amplitude_relationship(sig)
+ 
+    # repeat for wrapping
+    bins_ext = np.concatenate([bins, bins + 2 * np.pi])
+    amp_ext  = np.concatenate([amp, amp])
+ 
+    ax_phase.fill_between(bins, amp, alpha=0.20, color=GAMMA)
+    ax_phase.plot(bins, amp, color=GAMMA, linewidth=2.0)
+ 
+    # mark theta peaks/troughs
+    ax_phase.axvline(0,           color=THETA, linewidth=1.2, linestyle='--',
+                     alpha=0.6, label='Theta peak (0)')
+    ax_phase.axvline(-np.pi / 2, color=THETA, linewidth=0.8, linestyle=':',
+                     alpha=0.5, label='Trough (−π/2)')
+    ax_phase.set_xticks([-np.pi, -np.pi/2, 0, np.pi/2, np.pi])
+    ax_phase.set_xticklabels(['-π', '-π/2', '0', 'π/2', 'π'],
+                              fontfamily='monospace', fontsize=7)
+    ax_phase.legend(fontsize=7, facecolor=BG, edgecolor=BORDER)
+    ax_phase.text(0.55, 0.88,
+                  'Each peak = one\nmemory item slot',
+                  color=GAMMA, fontsize=7.5, fontfamily='monospace',
+                  transform=ax_phase.transAxes)
+ 
+ 
+def draw_model(n_items=4):
+    ax_model.cla()
+    ax_model.set_facecolor(PANEL)
+    for sp in ax_model.spines.values():
+        sp.set_edgecolor(BORDER); sp.set_linewidth(0.8)
+    ax_model.axis('off')
+    ax_model.set_xlim(0, 1); ax_model.set_ylim(0, 1)
+    ax_model.set_title(f'Temporal Multiplexing Model  ({n_items} items)',
+                       color=TEXT, fontsize=9, fontfamily='monospace',
+                       pad=7, fontweight='bold')
+ 
+    # draw theta cycle
+    t_cycle = np.linspace(0, 1, 200)
+    theta_y = 0.55 + 0.12 * np.sin(2 * np.pi * t_cycle)
+    ax_model.plot(t_cycle, theta_y, color=THETA, linewidth=2.5, alpha=0.7)
+ 
+    # draw gamma bursts at specific phases
+    for item in range(n_items):
+        phase_frac = item / n_items
+        x_pos      = phase_frac + 0.5 / n_items
+        if x_pos > 1: x_pos -= 1
+        col        = ITEM_COLORS[item % len(ITEM_COLORS)]
+ 
+        # gamma burst
+        t_burst = np.linspace(x_pos - 0.04, x_pos + 0.04, 40)
+        gamma_y = 0.55 + 0.08 * np.sin(2 * np.pi * 5 * (t_burst - x_pos + 0.04) / 0.08)
+        mask    = (t_burst >= 0) & (t_burst <= 1)
+        ax_model.plot(t_burst[mask], gamma_y[mask], color=col, linewidth=2.0)
+ 
+        # item label
+        ax_model.text(x_pos, 0.30, f'Item {item+1}',
+                      color=col, fontsize=7.5, fontweight='bold',
+                      fontfamily='monospace', ha='center', va='center')
+        ax_model.plot([x_pos, x_pos], [0.34, 0.50], color=col,
+                      linewidth=0.8, linestyle='--', alpha=0.5)
+ 
+    ax_model.text(0.5, 0.88, '← one theta cycle (≈166ms) →',
+                  color=THETA, fontsize=7.5, fontfamily='monospace',
+                  ha='center', transform=ax_model.transAxes)
+    ax_model.text(0.5, 0.12,
+                  'Each item = distinct gamma sub-window\nwithin the same theta cycle',
+                  color=DIM, fontsize=7, fontfamily='monospace',
+                  ha='center', transform=ax_model.transAxes)
+ 
+ 
+def draw_load():
+    ax_load.cla()
+    style_ax(ax_load, 'Coupling Strength vs Memory Load',
+             'Number of items in memory', 'PAC strength (MVL)')
+ 
+    loads   = np.arange(1, 9)
+    pac_str = []
+    for n in loads:
+        sig, _, _ = make_theta_gamma_signal(n_items=min(n, 7), noise_level=0.6)
+        bins, amp = compute_phase_amplitude_relationship(sig)
+        pac_str.append(amp.max() - amp.min())
+ 
+    pac_arr = np.array(pac_str)
+    colors  = [ITEM_COLORS[min(i, len(ITEM_COLORS)-1)] for i in range(len(loads))]
+    ax_load.bar(loads, pac_arr, color=colors, alpha=0.80, linewidth=0)
+    ax_load.axvline(7.5, color='black', linewidth=1.5, linestyle='--',
+                    alpha=0.6, label="Miller's limit (7±2)")
+    ax_load.set_xticks(loads)
+    ax_load.legend(fontsize=7, facecolor=BG, edgecolor=BORDER)
+    ax_load.text(0.62, 0.88, "Capacity limit\n= γ cycles / θ cycle",
+                 color=DIM, fontsize=7.5, fontfamily='monospace',
+                 transform=ax_load.transAxes)
+ 
+ 
+def draw_info():
+    ax_info.cla()
+    ax_info.set_facecolor(PANEL)
+    for sp in ax_info.spines.values():
+        sp.set_edgecolor(BORDER); sp.set_linewidth(0.8)
+    ax_info.axis('off')
+    ax_info.set_title('Why This Matters', color=TEXT, fontsize=9,
+                      fontfamily='monospace', pad=7, fontweight='bold')
+ 
+    findings = [
+        (THETA,  'THETA AS CLOCK',
+                 'Hippocampal theta (4-8Hz)\ncreates a master timing signal.\nEach cycle = one memory\n"frame" (~125-250ms).'),
+        (GAMMA,  'GAMMA AS CONTENT',
+                 'Gamma bursts (~20ms) within\neach theta cycle carry\nitem-specific firing patterns.\nMultiple items per cycle.'),
+        (COUPLED,'PREDICTS CAPACITY',
+                 "Miller's 7±2 items maps onto\n5-9 gamma cycles per theta\ncycle — not a coincidence\n(Lisman & Idiart 1995)."),
+    ]
+ 
+    y = 0.96
+    for col, title, body in findings:
+        ax_info.text(0.04, y, f'▸ {title}', color=col, fontsize=7.2,
+                     fontweight='bold', fontfamily='monospace',
+                     transform=ax_info.transAxes, va='top')
+        ax_info.text(0.04, y - 0.06, body, color=TEXT, fontsize=7,
+                     fontfamily='monospace', transform=ax_info.transAxes,
+                     va='top', linespacing=1.55)
+        y -= 0.30
+ 
+ 
+# ── buttons ───────────────────────────────────────────────────────────────────
+btn_row = gridspec.GridSpecFromSubplotSpec(
+    1, 5, subplot_spec=outer[2], wspace=0.05
+)
+ax_b  = [fig.add_subplot(btn_row[i]) for i in range(5)]
+btns  = []
+state = dict(items=4)
+labels = ['2 ITEMS', '4 ITEMS', '6 ITEMS', '7 ITEMS', 'SAVE PNG']
+for i, (ab, lbl) in enumerate(zip(ax_b, labels)):
+    col = '#e8f5e9' if i == 4 else '#e3f2fd'
+    b   = Button(ab, lbl, color=col, hovercolor='#bbdefb')
+    b.label.set_color(TEXT); b.label.set_fontsize(7.5)
+    b.label.set_fontfamily('monospace')
+    btns.append(b)
+ 
+ 
+def set_items(n):
+    state['items'] = n
+    draw_raw(n); draw_pac(n); draw_phase(n); draw_model(n)
+    draw_load(); draw_info()
+    fig.canvas.draw_idle()
+ 
+ 
+for i, n in enumerate([2, 4, 6, 7]):
+    btns[i].on_clicked(lambda e, ni=n: set_items(ni))
+ 
+ 
+def save_png(e=None):
+    fig.savefig('theta_gamma_coupling.png', dpi=150,
+                bbox_inches='tight', facecolor=BG)
+    print('Saved: theta_gamma_coupling.png')
+ 
+ 
+btns[4].on_clicked(save_png)
+ 
+# ── render ────────────────────────────────────────────────────────────────────
+draw_raw(4); draw_pac(4); draw_phase(4)
+draw_model(4); draw_load(); draw_info()
+ 
+plt.savefig('theta_gamma_coupling.png', dpi=150,
+            bbox_inches='tight', facecolor=BG)
+print('Saved: theta_gamma_coupling.png')
+ 
+plt.show()
